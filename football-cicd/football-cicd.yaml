@@ -1,0 +1,1805 @@
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: mysql-22
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3307
+      name: http
+      protocol: TCP
+---
+kind: Endpoints
+apiVersion: v1
+metadata:
+  name: mysql-22
+subsets:
+  - addresses:
+      - ip: 192.168.1.22
+    ports:
+      - port: 3307
+        name: http
+        protocol: TCP
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: gitlab-14
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      name: http
+      protocol: TCP
+---
+kind: Endpoints
+apiVersion: v1
+metadata:
+  name: gitlab-14
+subsets:
+  - addresses:
+      - ip: 192.168.1.14
+    ports:
+      - port: 80
+        name: http
+        protocol: TCP
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: harbor-146
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5443
+      name: http
+      protocol: TCP
+---
+kind: Endpoints
+apiVersion: v1
+metadata:
+  name: harbor-146
+subsets:
+  - addresses:
+      - ip: 192.168.1.146
+    ports:
+      - port: 5443
+        name: http
+        protocol: TCP
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: build-cache
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 40Gi
+  # 拉取、构建代码的pvc放在主节点
+  storageClassName: default-85-sc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: docker-cache
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 30Gi
+  # docker缓存的pvc放在另一个节点的ssd盘
+  storageClassName: ssd-86
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: basic-user-pass-git
+  annotations:
+    tekton.dev/git-0: http://gitlab-14 # Described below
+    tekton.dev/git-1: http://joynova.com # Described below
+type: kubernetes.io/basic-auth
+stringData:
+  username: dev
+  password: dev123
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: basic-user-pass-harbor
+  annotations:
+    tekton.dev/docker-0: harbor.joynova.com:5443 # Described below
+type: kubernetes.io/basic-auth
+stringData:
+  username: admin
+  password: dev123
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: build-bot
+secrets:
+  - name: basic-user-pass-git
+  - name: basic-user-pass-harbor
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-triggers-example-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: triggers-example-eventlistener-binding
+subjects:
+- kind: ServiceAccount
+  name: tekton-triggers-example-sa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-roles
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: triggers-example-eventlistener-clusterbinding
+subjects:
+- kind: ServiceAccount
+  name: tekton-triggers-example-sa
+  namespace: football-cicd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-clusterroles
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: clone-repo
+spec:
+  workspaces:
+    - name: common-workspace
+      description: git clone的源码目录
+    - name: ssh-directory
+      optional: true
+    - name: basic-auth
+      optional: true
+    - name: ssl-ca-directory
+      optional: true
+  params:
+    - name: revision
+      description: Revision to checkout. (branch, tag, sha, ref, etc...)
+      type: string
+    - name: url
+      type: string
+      default: "http://gitlab-14/greenly/greenly-master.git"
+    - name: pre_check_packages
+      type: string
+      description: 预编译检查整体语法错误
+      default: "cmd/all_in_one"
+  results:
+    - name: commit
+      description: The precise commit SHA that was fetched by this Task.
+    - name: url
+      description: The precise URL that was fetched by this Task.
+    - name: author
+    - name: msg
+      description: git提交注释
+  steps:
+    - name: clone
+      image: "dyrnq/tektoncd-pipeline-cmd-git-init:v0.29.0"
+#       securityContext:
+#         runAsNonRoot: true
+#         runAsUser: 65532
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        date +%s > $(workspaces.common-workspace.path)/start-ts
+        if [ "${PARAM_VERBOSE}" = "true" ] ; then
+          set -x
+        fi
+        set -x
+        if [ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" = "true" ] ; then
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" "${PARAM_USER_HOME}/.git-credentials"
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.gitconfig" "${PARAM_USER_HOME}/.gitconfig"
+          chmod 400 "${PARAM_USER_HOME}/.git-credentials"
+          chmod 400 "${PARAM_USER_HOME}/.gitconfig"
+        fi
+        if [ "${WORKSPACE_SSH_DIRECTORY_BOUND}" = "true" ] ; then
+          cp -R "${WORKSPACE_SSH_DIRECTORY_PATH}" "${PARAM_USER_HOME}"/.ssh
+          chmod 700 "${PARAM_USER_HOME}"/.ssh
+          chmod -R 400 "${PARAM_USER_HOME}"/.ssh/*
+        fi
+        if [ "${WORKSPACE_SSL_CA_DIRECTORY_BOUND}" = "true" ] ; then
+           export GIT_SSL_CAPATH1="${WORKSPACE_SSL_CA_DIRECTORY_PATH}"
+           if [ "${PARAM_CRT_FILENAME}" != "" ] ; then
+              export GIT_SSL_CAINFO1="${WORKSPACE_SSL_CA_DIRECTORY_PATH}/${PARAM_CRT_FILENAME}"
+           fi
+        fi
+        CHECKOUT_DIR="${WORKSPACE_OUTPUT_PATH}/"
+        mkdir -p ${CHECKOUT_DIR}
+
+        # 清理仓库拉取目录
+        # 删除隐藏文件
+        rm -rf "${CHECKOUT_DIR}"/.[!.]*
+        # 删除所有文件
+        rm -rf "${CHECKOUT_DIR:?}"/*
+
+        test -z "${PARAM_HTTP_PROXY}" || export HTTP_PROXY="${PARAM_HTTP_PROXY}"
+        test -z "${PARAM_HTTPS_PROXY}" || export HTTPS_PROXY="${PARAM_HTTPS_PROXY}"
+        test -z "${PARAM_NO_PROXY}" || export NO_PROXY="${PARAM_NO_PROXY}"
+        /ko-app/git-init \
+          -url="${PARAM_URL}" \
+          -revision="${PARAM_REVISION}" \
+          -refspec="${PARAM_REFSPEC}" \
+          -path="${CHECKOUT_DIR}" \
+          -sslVerify="${PARAM_SSL_VERIFY}" \
+          -submodules="${PARAM_SUBMODULES}" \
+          -depth="0" \
+          -sparseCheckoutDirectories="${PARAM_SPARSE_CHECKOUT_DIRECTORIES}"
+        cd "${CHECKOUT_DIR}"
+        RESULT_SHA="$(git rev-parse HEAD)"
+        AUTHOR="$(git log --pretty=format:'%an' | head -n 1)"
+        MSG="$(git log --pretty=format:'%s' | head -n 1)"
+        EXIT_CODE="$?"
+        if [ "${EXIT_CODE}" != 0 ] ; then
+          exit "${EXIT_CODE}"
+        fi
+        printf "%s" "${RESULT_SHA}" > "$(results.commit.path)"
+        printf "%s" "${PARAM_URL}" > "$(results.url.path)"
+        printf "%s" "${AUTHOR}" > "$(results.author.path)"
+        printf "%s" "${MSG}" > "$(results.msg.path)"
+        echo "output path:"
+        ls ${CHECKOUT_DIR}
+        cat $(results.commit.path) > ${CHECKOUT_DIR}/git-sha
+        cat $(results.author.path) > ${CHECKOUT_DIR}/git-author
+        cat $(results.msg.path) > ${CHECKOUT_DIR}/git-msg
+    - name: pre-check
+      image: golang:1.18.1
+      workingDir: $(workspaces.common-workspace.path)/source-code
+      script: |
+        # 预先编译all_in_one检查是否可以编译
+
+        # 修改hosts
+        echo "192.168.1.14 joynova.com" >> /etc/hosts
+        echo "192.168.1.146 harbor.joynova.com" >> /etc/hosts
+
+        app=`basename $(params.pre_check_packages)`
+        echo "compile application:"$app
+
+        mkdir -p $GOMODCACHE
+        mkdir -p $GOCACHE
+
+        set -x
+
+        cd $(workspaces.common-workspace.path)/source-code
+
+        # 配置私有仓库访问
+        go env -w GOPROXY=https://goproxy.cn
+        go env -w GOINSECURE="joynova.com"
+        go env -w GOPRIVATE="joynova.com"
+        go env -w GONOSUMDB="joynova.com"
+        echo "===============go env===================="
+        go env
+        echo "========================================="
+        #git config --global url."git@joynova.com".insteadOf "http://joynova.com"
+
+        # 拉取依赖
+        go mod tidy
+        echo "go mod拉取依赖完毕。"
+
+        # 进入目录开始编译
+        cd $(workspaces.common-workspace.path)/source-code/$(params.pre_check_packages)
+        pwd
+        go build -v
+        cd $(workspaces.common-workspace.path)/source-code/tools/dev_tools
+        go build -v -o db_sync_new db_sync.go
+  stepTemplate:
+    env:
+    - name: HOME
+      value: "/tekton/home"
+    - name: PARAM_URL
+      value: $(params.url)
+    - name: PARAM_REVISION
+      value: $(params.revision)
+    - name: PARAM_REFSPEC
+      value: ""
+    - name: PARAM_SUBMODULES
+      value: "true"
+    - name: PARAM_DEPTH
+      value: "1"
+    - name: PARAM_SSL_VERIFY
+      value: "false"
+    - name: PARAM_CRT_FILENAME
+      value: "ca-bundle.crt"
+    - name: PARAM_DELETE_EXISTING
+      value: "true"
+    - name: PARAM_HTTP_PROXY
+      value: ""
+    - name: PARAM_HTTPS_PROXY
+      value: ""
+    - name: PARAM_NO_PROXY
+      value: ""
+    - name: PARAM_VERBOSE
+      value: "true"
+    - name: PARAM_SPARSE_CHECKOUT_DIRECTORIES
+      value: ""
+    - name: PARAM_USER_HOME
+      value: "/tekton/home"
+    - name: WORKSPACE_OUTPUT_PATH
+      value: $(workspaces.common-workspace.path)/source-code
+    - name: WORKSPACE_SSH_DIRECTORY_BOUND
+      value: $(workspaces.ssh-directory.bound)
+    - name: WORKSPACE_SSH_DIRECTORY_PATH
+      value: $(workspaces.ssh-directory.path)
+    - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
+      value: $(workspaces.basic-auth.bound)
+    - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
+      value: $(workspaces.basic-auth.path)
+    - name: WORKSPACE_SSL_CA_DIRECTORY_BOUND
+      value: $(workspaces.ssl-ca-directory.bound)
+    - name: WORKSPACE_SSL_CA_DIRECTORY_PATH
+      value: $(workspaces.ssl-ca-directory.path)
+    - name: GOOS
+      value: "linux"
+    - name: GOARCH
+      value: "amd64"
+    - name: GO111MODULE
+      value: "on"
+    - name: GOCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gocache"
+    - name: GOMODCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gomodcache"
+    - name: CGO_ENABLED
+      value: ""
+
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: app-ci
+spec:
+  params:
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: packages
+    description: "main包入口，相对项目路径的，例如cmd/micro/account/cmd/all_in_one"
+  - name: helm-packages
+    description: helm部署包的入口，相对项目路径的，例如ops/helm/v1/lobby-rollup/gm
+  - name: helm-packages1
+    description: helm部署包的另一入口，比如某些项目需要两个部署包的，例如gateway-dep和gateway-svc
+    default: ""
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+    default: "latest"
+  - name: mysql-host
+    default: "mysql-22"
+  - name: registry_project
+    description: "仓库项目，镜像全名[$insecure_registry/$registry_project/`basename $packages`:$build_no]"
+  - name: insecure_registry
+    description: Allows the user to push to an insecure registry that has been specified
+    default: "harbor.joynova.com:5443"
+  workspaces:
+    - name: common-workspace
+  results:
+  - name: binary-md5
+    description: 二进制的md5，与上次的值比对，相同则服务代码无改动
+  - name: binary-md5-changed
+  - name: helm-md5
+    description: helm部署包目录的md5，目录改动需要重新打镜像
+  - name: helm-old-version
+    description: helm部署的旧版本
+  steps:
+  - name: code-build
+    image: golang:1.18.1
+    script: |
+      app=`basename $(params.packages)`
+      echo "compile application:"$app
+      go env -w GOPROXY="https://goproxy.cn,https://goproxy.io,direct"
+      go env -w GOPRIVATE=joynova.com
+      go env -w GOINSECURE=joynova.com
+      cd $(workspaces.common-workspace.path)/source-code/$(params.packages)
+      pwd
+      echo "go mod cache path:"
+      ls $GOMODCACHE
+      echo "==================="
+      go build -v -trimpath -buildvcs=false
+      echo "md5 sum:"`md5sum $app`
+      cur_md5=`md5sum $app | awk '{print $1}'`
+      printf "%s" "${cur_md5}" > $(results.binary-md5.path)
+  - name: check-binary-change
+    image: harbor.joynova.com:5443/tools/k8s8xctl:latest
+    script: |
+      app=`basename $(params.packages)`
+      query_app_old_info=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd --skip-column-names -s -e \
+              "select concat(binary_md5,',',helm_pack_md5,',',helm_tag) from app_log where namespace='$(params.namespace)' \
+              and app='${app}' and pipeline_state=1 order by pipeline_id desc limit 0,1"`
+      old_md5=`echo $query_app_old_info|awk -F',' '{print $1}'`
+      old_helm_md5=`echo $query_app_old_info|awk -F',' '{print $2}'`
+      old_helm_version=`echo $query_app_old_info|awk -F',' '{print $3}'`
+      cur_md5=`cat $(results.binary-md5.path)`
+      echo "old md5:"$old_md5
+      echo "cur md5:"$cur_md5
+      if [ "${old_md5}" = "${cur_md5}" ]; then
+        echo "false" > $(results.binary-md5-changed.path)
+      else
+        echo "true" > $(results.binary-md5-changed.path)
+      fi
+
+      # 检查helm部署包是否改动
+      helm_pack_md5=`find $(workspaces.common-workspace.path)/source-code/$(params.helm-packages) \
+        -type f -name "*" | sort | xargs md5sum |md5sum|awk -F' ' '{print $1}'`
+      if [ "$(params.helm-packages1)" != "" ]; then
+        helm_pack1_md5=`find $(workspaces.common-workspace.path)/source-code/$(params.helm-packages1) \
+                -type f -name "*" | sort | xargs md5sum |md5sum|awk -F' ' '{print $1}'`
+        helm_pack_md5=`echo "$helm_pack_md5$helm_pack1_md5"|md5sum|awk -F' ' '{print $1}'`
+      fi
+
+      echo "old helm md5:"$old_helm_md5
+      echo "new helm md5:"$helm_pack_md5
+      if [ "${old_helm_md5}" != "${helm_pack_md5}" ]; then
+        echo "true" > $(results.binary-md5-changed.path)
+      fi
+      echo "${helm_pack_md5}" > $(results.helm-md5.path)
+      echo "${old_helm_version}" > $(results.helm-old-version.path)
+  - name: image-build
+    image: docker.io/library/docker:stable@sha256:18ff92d3d31725b53fa6633d60bed323effb6d5d4588be7b547078d384e0d4bf
+    script: |
+      echo "192.168.1.14 joynova.com" >> /etc/hosts
+      echo "192.168.1.146 harbor.joynova.com" >> /etc/hosts
+      if [ `cat $(results.binary-md5-changed.path)` = "false" ]; then
+        echo "代码无改动，跳过镜像构建"
+        exit 0
+      fi
+      docker images
+      cd $(workspaces.common-workspace.path)/source-code/$(params.packages)
+      app=`basename $(params.packages)`
+
+      # 没有Dockerfile，就是微服务，dockerfile在上级目录
+      git_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      if ! test -f Dockerfile; then
+        cp ../docker_entrypoint.sh .
+        cp ../Dockerfile .
+        eval sed -i 's/application/${app}/g' Dockerfile
+        eval sed -i 's/application/${app}/g' docker_entrypoint.sh
+        eval sed -i 's/gitsha/${git_sha}/g' Dockerfile
+      fi
+
+      echo "docker build context:"
+      ls .
+
+      # 构建镜像
+      docker build -f Dockerfile -t "$(params.insecure_registry)/$(params.registry_project)/$app:v$(params.build_no)" .
+      # 查看所有镜像
+      docker images
+      # 推送镜像
+      docker push $(params.insecure_registry)/$(params.registry_project)/$app:v$(params.build_no)
+
+      set +e
+
+      # 只保留最近2个镜像
+      old_image_version=`expr $(params.build_no) - 2`
+      echo "删除旧镜像:$(params.insecure_registry)/$(params.registry_project)/$app:v$old_image_version"
+      docker rmi $(params.insecure_registry)/$(params.registry_project)/$app:v$old_image_version
+      for v in {1..$(params.build_no)}; do
+        history_image_version=v$v
+        docker rmi $(params.insecure_registry)/$(params.registry_project)/$app:$history_image_version
+      done
+      # 删除虚悬镜像释放空间
+      none_images=`docker images -q -f dangling=true`
+      for none_image in $none_images; do
+      	docker rmi -f $none_image
+      done
+  - name: helm-build
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      if [ `cat $(results.binary-md5-changed.path)` = "false" ]; then
+        echo "代码无改动，跳过helm包构建"
+        exit 0
+      fi
+
+      set -xe
+
+      # 添加helm仓库
+      helm repo add --ca-file /cert/ca.crt --cert-file /cert/harbor.joynova.com.crt --key-file /cert/harbor.joynova.com.key \
+              cicd  https://$(params.insecure_registry)/chartrepo/$(params.registry_project) --username=admin --password=dev123
+      mkdir -p /tmp/helm-output
+
+      app=`basename $(params.packages)`
+
+      helm_package_template=/tmp/helm_package_template
+
+      # 拷贝helm模板包，此时这个仓库代码是多pod并行读的，不拷贝出去搞会出并发问题
+      cp -rf $(workspaces.common-workspace.path)/source-code/$(params.helm-packages) /tmp/helm_package_template
+
+      # 修改helm配置文件参数
+      eval sed -i 's,r_name,${app},g' $helm_package_template/Chart.yaml
+      eval sed -i 's,r_version,$(params.build_no),g' $helm_package_template/Chart.yaml
+      app_repo_url=$(params.insecure_registry)\/$(params.registry_project)\/$app
+      # app_repo_url1=${app_repo_url//\//\\/} #这个写法要报错
+      eval sed -i 's,r_repo,${app_repo_url},g' $helm_package_template/values.yaml
+      eval sed -i 's,r_tag,v$(params.build_no),g' $helm_package_template/values.yaml
+      eval sed -i 's,r_busy,harbor.joynova.com:5443\/tools\/busybox:v0.0.2,g' $helm_package_template/values.yaml
+
+      helm package $helm_package_template -d /tmp/helm-output
+
+      # 如果存在第二个helm部署包，也构建出来
+      if [ "$(params.helm-packages1)" != "" ]; then
+        helm_package_template1=/tmp/helm_package_template1
+        cp -rf $(workspaces.common-workspace.path)/source-code/$(params.helm-packages1) /tmp/helm_package_template1
+        eval sed -i 's,r_version,$(params.build_no),g' $helm_package_template1/Chart.yaml
+        eval sed -i 's,r_name,${app},g' $helm_package_template/Chart.yaml
+        eval sed -i 's,r_repo,${app_repo_url},g' $helm_package_template1/values.yaml
+        eval sed -i 's,r_tag,v$(params.build_no),g' $helm_package_template1/values.yaml
+        eval sed -i 's,r_busy,harbor.joynova.com:5443\/tools\/busybox:v0.0.2,g' $helm_package_template1/values.yaml
+        helm package $helm_package_template1 -d /tmp/helm-output
+      fi
+
+      # 查看helm读取插件的目录，调试信息
+      helm env|grep HELM_DATA_HOME
+
+      # 推送镜像
+      for tar_file in `ls /tmp/helm-output`; do
+        helm cm-push --ca-file /cert/ca.crt --cert-file /cert/harbor.joynova.com.crt --key-file /cert/harbor.joynova.com.key \
+               /tmp/helm-output/$tar_file cicd
+      done
+  - name: post-build
+    image: harbor.joynova.com:5443/tools/k8s8xctl:latest
+    script: |
+      app=`basename $(params.packages)`
+      old_helm_version=`cat $(results.helm-old-version.path)`
+      helm_new_tag=$old_helm_version
+      is_upgrade=0
+      if [ `cat $(results.binary-md5-changed.path)` = "true" ]; then
+        echo "代码改动，存储新md5值到数据库"
+        md5=`cat $(results.binary-md5.path)`
+        helm_md5=`cat $(results.helm-md5.path)`
+        helm_new_tag=0.0.$(params.build_no)
+        is_upgrade=1
+        mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+                "insert into app_log(namespace,app,binary_md5,helm_pack_md5,pipeline_id,docker_tag,helm_tag) \
+                values('$(params.namespace)','${app}','${md5}','${helm_md5}',$(params.build_no),'v$(params.build_no)','${helm_new_tag}')"
+      else
+        echo "代码无改动"
+      fi
+
+      # 生成helm更新清单，格式：release,旧版,新版,是否改动
+      mkdir -p $(workspaces.common-workspace.path)/source-code/helm-version-list
+      if [ "$old_helm_version" = "" ]; then
+        # 第一次构建
+        echo "first build app, initialize version $helm_new_tag"
+        old_helm_version=$helm_new_tag
+      fi
+      echo "$app,$old_helm_version,$helm_new_tag,$is_upgrade" \
+        > $(workspaces.common-workspace.path)/source-code/helm-version-list/$app
+  sidecars:
+  - image: docker:dind
+    name: server
+    args:
+      - --storage-driver=aufs
+      - --userland-proxy=false
+      - --debug
+      - --insecure-registry=$(params.insecure_registry)
+    securityContext:
+      privileged: true
+    env:
+    # Write generated certs to the path shared with the client.
+    - name: DOCKER_TLS_CERTDIR
+      value: /certs
+    volumeMounts:
+    - mountPath: /var/run/
+      name: dind-socket
+    - mountPath: /certs/client
+      name: dind-certs
+    # 映射pvc到/var/lib/docker目录，这样可以使用docker构建的layer缓存，加速每次ci的镜像构建速度
+    - name: build-cache
+      mountPath: /var/lib/docker
+      subPath: ci-cache/$(params.packages)
+    readinessProbe:
+      periodSeconds: 1
+      exec:
+        command: ['ls', '/certs/client/ca.pem']
+  volumes:
+    - name: dind-certs
+      emptyDir: {}
+    - name: dind-socket
+      emptyDir: {}
+    - name: build-cache
+      persistentVolumeClaim:
+        claimName: docker-cache
+  stepTemplate:
+    env:
+    - name: GOOS
+      value: "linux"
+    - name: GOARCH
+      value: "amd64"
+    - name: GO111MODULE
+      value: "auto"
+    - name: GOCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gocache"
+    - name: GOMODCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gomodcache"
+    - name: CGO_ENABLED
+      value: ""
+    - name: GOSUMDB
+      value: ""
+    # Connect to the sidecar over TCP, with TLS.
+    - name: DOCKER_HOST
+      value: tcp://localhost:2376
+    # Verify TLS.
+    - name: DOCKER_TLS_VERIFY
+      value: '1'
+    # Use the certs generated by the sidecar daemon.
+    - name: DOCKER_CERT_PATH
+      value: /certs/client
+    volumeMounts:
+    - mountPath: /var/run/
+      name: dind-socket
+    - mountPath: /certs/client
+      name: dind-certs
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: wait-ci
+spec:
+  params:
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: revision
+  - name: gamedata_url
+    description: "配置表的分支链接"
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+  - name: trigger_user
+    description: 流水线触发的用户
+  - name: registry_project
+    description: "仓库项目，镜像全名[$insecure_registry/$registry_project/`basename $packages`:$build_no]"
+  - name: insecure_registry
+    description: Allows the user to push to an insecure registry that has been specified
+    default: "harbor.joynova.com:5443"
+  - name: gateway-tport
+    description: "大厅网关tcp服务端口"
+  - name: gateway-wport
+    description: "大厅网关websocket服务端口"
+  - name: gm-port
+    description: "gm服务端口"
+  - name: reply-tport1
+    description: "战斗服监听tcp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-uport1
+    description: "战斗服监听udp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-rpcport1
+    description: "战斗服监听rpc端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-traceport1
+    description: "战斗服prometheus监听端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-tport2
+    description: "战斗服监听tcp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-uport2
+    description: "战斗服监听udp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-rpcport2
+    description: "战斗服监听rpc端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-traceport2
+    description: "战斗服prometheus监听端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  workspaces:
+    - name: common-workspace
+  results:
+    - name: is-gateway-upgrade
+      description: "gateway是否触发热更"
+    - name: is-reply-upgrade
+      description: "reply是否触发热更"
+    - name: change-apps
+    - name: pre-pipeline-sha
+      description: "上一次流水线的代码版本"
+    - name: pre-pipeline-id
+      description: "上一次流水线的编号"
+    - name: gamedata-url
+    - name: gamedata-revision
+  steps:
+  - name: wait-ci-result
+    image: harbor.joynova.com:5443/tools/k8s8xctl:latest
+    script: |
+      # 查询本次构建发生变动的app
+      change_apps=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+              "select app from app_log where namespace='$(params.namespace)' and pipeline_id=$(params.build_no) order by app asc" --skip-column-names -s`
+      echo "----------------"
+
+      change_app_records=""
+      if [ "$change_apps" != "" ]; then
+        change_app_records1=""
+        for line in $change_apps; do
+          echo "${line} app changed with new version:v0.0.$(params.build_no)"
+          change_app_records1="${change_app_records1}${line},"
+        done
+        change_app_records=`echo ${change_app_records1}`
+      else
+        echo "no app changed!"
+      fi
+
+      printf "%s" $change_app_records > $(results.change-apps.path)
+
+      echo "----------------"
+
+      pre_pipeline_sha=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd --skip-column-names -s -e \
+                    "select sha from pipeline_log where namespace='$(params.namespace)' order by pipeline_id desc limit 0,1"`
+      pre_pipeline_id=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd --skip-column-names -s -e \
+                    "select pipeline_id from pipeline_log where namespace='$(params.namespace)' order by pipeline_id desc limit 0,1"`
+      printf "%s" $pre_pipeline_sha > $(results.pre-pipeline-sha.path)
+      printf "%s" $pre_pipeline_id > $(results.pre-pipeline-id.path)
+
+      # 收集helm版本结果
+      pipeline_record_path=$(workspaces.common-workspace.path)/ci-result/pipeline-log/pipeline-$(params.build_no)
+      mkdir -p $pipeline_record_path
+      rm -rf $pipeline_record_path/*
+      for result in `ls $(workspaces.common-workspace.path)/source-code/helm-version-list`; do
+        cat $(workspaces.common-workspace.path)/source-code/helm-version-list/$result >> $pipeline_record_path/version.list
+      done
+      echo "helm部署版本列表数据："
+      cat $pipeline_record_path/version.list
+
+      # 骚操作，用ubuntu镜像的git工具切到pre提交，下一个step编译
+      cd $(workspaces.common-workspace.path)/source-code
+      pre_sha=`cat $(results.pre-pipeline-sha.path)`
+      if [ "$pre_sha" != "" ]; then
+        echo "切换源代码到上一次提交，用于下一个step构建dbsync工具"
+        git checkout $pre_sha
+      fi
+  - name: build-pre-db-sync
+    image: golang:1.18.1
+    workingDir: $(workspaces.common-workspace.path)/source-code
+    script: |
+      ls $(workspaces.common-workspace.path)/source-code/tools/dev_tools/db_sync_new
+
+      pre_sha=`cat $(results.pre-pipeline-sha.path)`
+      cur_pipeline_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      if [ "$pre_sha" != "" ]; then
+        if [ "$pre_sha" != "$cur_pipeline_sha" ]; then
+          echo "上次提交sha：$pre_sha，当前提交sha：$cur_pipeline_sha，有代码变动，编译旧版db_sync"
+          cd $(workspaces.common-workspace.path)/source-code/tools/dev_tools
+          go env -w GOCACHE="$(workspaces.common-workspace.path)/ci-cache/gocache"
+          go env -w GOMODCACHE="$(workspaces.common-workspace.path)/ci-cache/gomodcache"
+          go build -v -o db_sync_old db_sync.go
+        fi
+      fi
+  - name: cd
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      echo "切换源码到最新提交"
+      cd $(workspaces.common-workspace.path)/source-code
+      git checkout $(params.revision)
+      cd -
+
+      set +x
+
+      k8s_namespace="football-$(params.namespace)"
+      version_list_file=$(workspaces.common-workspace.path)/ci-result/pipeline-log/pipeline-$(params.build_no)/version.list
+      cur_pipeline_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      pre_pipeline_sha=`cat $(results.pre-pipeline-sha.path)`
+
+      # 重读配置表
+      set -x
+      full_gamedata_url=http://192.168.1.134:3690/svn/ma83/soccer_2/gameData/$(params.gamedata_url)/server
+      svn co $full_gamedata_url /tmp/gamedata --username likun --password likun
+      gamedata_revision=`cd /tmp/gamedata && svn info | grep Revision | sed 's/Revision: //g'`
+      echo "配置表链接:$full_gamedata_url"
+      echo "配置表最新版本:$gamedata_revision"
+      printf "%s" $full_gamedata_url > $(results.gamedata-url.path)
+      printf "%s" $gamedata_revision > $(results.gamedata-revision.path)
+      rm -rf ~/.ssh && mkdir ~/.ssh
+      ssh-keygen -t rsa -C "tekton-cicd@joynova.com.cn" -P "" -f ~/.ssh/id-rsa
+      #rm -rf /tmp/gamedata/.svn
+      # 先验证host
+      eval sshpass -p dev123 ssh -o StrictHostKeyChecking=no root@192.168.1.141 "echo"
+      # 再scp不会报错
+      eval sshpass -p dev123 scp -r /tmp/gamedata root@192.168.1.141:/data/$k8s_namespace
+      set +e
+      curl 192.168.1.141:$(params.gm-port)/gm/reload_csv?gm_id=tekton-cicd
+      set -e
+      set +x
+
+      # 对比数据库diff
+      if [ "$pre_pipeline_sha" != "$cur_pipeline_sha" ]; then
+          echo "代码版本与上次不一致，进行数据库diff生成：$pre_pipeline_sha -> $cur_pipeline_sha"
+          # 比对数据库diff
+          old_version_db="tekton_cicd_comp_db_$(params.namespace)_old"
+          new_version_db="tekton_cicd_comp_db_$(params.namespace)_new"
+          # 先清空数据库
+          echo "清空对比旧数据库$old_version_db"
+          echo "清空对比新数据库$new_version_db"
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "DROP DATABASE IF EXISTS $old_version_db;"
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "DROP DATABASE IF EXISTS $new_version_db;"
+          # 创建新旧数据库
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "CREATE DATABASE IF NOT EXISTS $old_version_db DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_general_ci;"
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "CREATE DATABASE IF NOT EXISTS $new_version_db DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_general_ci;"
+
+          diffout=$(workspaces.common-workspace.path)/ci-result/pipeline-log/pipeline-$(params.build_no)/dbscript
+
+          # 直接先恢复新版本的数据库
+          $(workspaces.common-workspace.path)/source-code/tools/dev_tools/db_sync_new -a mysql-22:3307 -u root -p dev123 -d $new_version_db
+
+          if [ "$pre_pipeline_sha" != "" ]; then
+            echo "不是第一次构建，且当前流水线代码版本与上次不一致，恢复旧数据库作对比：$pre_pipeline_sha -> $cur_pipeline_sha"
+            # 不是第一次构建，恢复老版本数据库
+            /$(workspaces.common-workspace.path)/source-code/tools/dev_tools/db_sync_old -a mysql-22:3307 -u root -p dev123 -d $old_version_db
+          elif [ "$pre_pipeline_sha" = "" ]; then
+            echo "第一次构建，清空dbdiff目录，防止旧的调试数据影响"
+            rm -rf $diffout/*
+          fi
+
+          # 开始比对新旧数据库
+          mkdir -p $diffout
+          dbdiff -ip mysql-22:3307 -u root -pwd dev123 \
+                  -od $old_version_db -nd $new_version_db -dir $diffout -mode shard -cm "$(params.build_no)"
+
+          # 将diff写入数据库存储
+          for diffdir in $(ls -l ${diffout}/ | awk '/^d/ {print $9}'); do
+            if [ "`ls ${diffout}/$diffdir|wc -l`" = "0" ]; then
+              echo "数据库$diffdir未产生数据库diff，跳过"
+              continue
+            fi
+
+            db_name="$diffdir"
+            file_name=`ls ${diffout}/$diffdir|head -n 1`
+            file_content="`cat ${diffout}/$diffdir/$file_name`"
+            echo "数据库$diffdir产生增量文件$file_name"
+            mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd -e "set names utf8;insert into dbdiff_log(db_name,namespace,pipeline_id,pre_sha,cur_sha,file_name,content) \
+              values('$db_name', '$(params.namespace)', '$(params.build_no)', '$pre_pipeline_sha', '$cur_pipeline_sha', '$file_name', \"${file_content}\");"
+          done
+
+          # 从数据库查询全量脚本并应用
+          echo "开始应用脚本全量到数据库"
+          for diffdir in $(ls -l ${diffout}/ | awk '/^d/ {print $9}'); do
+              # fixme: 当前流水线在后续失败了，但是现在已经应用了数据库diff
+              dbdiff_history=`mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd --skip-column-names -s -e "select file_name from dbdiff_log where \
+                   namespace='$(params.namespace)' and db_name='$diffdir' and (pipeline_id=$(params.build_no) or state=1) order by pipeline_id asc"`
+
+              if [ "$dbdiff_history" != "" ]; then
+                mkdir -p /tmp/recover_dbdiff/$diffdir
+                # 这里居然不能用回车格式，否则解析不出？？
+                echo "${dbdiff_history}"|while read line; do \
+                  file_name=`echo $line|awk -F',' '{print $1}'`; \
+                  content=`mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd --skip-column-names -s -e "select content from dbdiff_log where \
+                        namespace='$(params.namespace)' and db_name='$diffdir' and file_name='$file_name'"`; \
+                  echo "${content}" > /tmp/recover_dbdiff/$diffdir/$file_name; done
+              else
+                echo "${diffdir}数据库脚本都没有改动"
+              fi
+              db_name="football_$(params.namespace)_$diffdir"
+
+              if [ "$dbdiff_history" != "" ]; then
+                if [ "$pre_pipeline_sha" = "" ]; then
+                  echo "流水线第一次构建，尝试清空数据库$db_name，再应用diff全量脚本"
+                  mysql -hmysql-22 -P3307 -uroot -pdev123 -e "DROP DATABASE IF EXISTS $db_name;" 2>/dev/null
+                  mysql -hmysql-22 -P3307 -uroot -pdev123 -e "CREATE DATABASE IF NOT EXISTS $db_name \
+                    DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_general_ci;" 2>/dev/null
+                fi
+                echo "开始恢复数据库$diffdir，diff脚本如下："
+                ls /tmp/recover_dbdiff/$diffdir
+                flyway -locations=filesystem:/tmp/recover_dbdiff/$diffdir migrate \
+                          -encoding=utf8 -driver=com.mysql.cj.jdbc.Driver \
+                          -url=jdbc:mysql://mysql-22:3307/$db_name \
+                          -user=root -password=dev123
+              fi
+          done
+      fi
+
+      echo "192.168.1.146 harbor.joynova.com" >> /etc/hosts
+      helm repo add --ca-file /cert/ca.crt --cert-file /cert/harbor.joynova.com.crt --key-file /cert/harbor.joynova.com.key \
+          cicd  https://$(params.insecure_registry)/chartrepo/$(params.registry_project) --username=admin --password=dev123
+      helm repo update
+
+      # 修改app构建状态，表示流水线正确执行完毕，后续滚动更新流程就不关心结果了
+      mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+                "update app_log set pipeline_state=1 where namespace='$(params.namespace)' and pipeline_id=$(params.build_no)"
+      mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+                "update dbdiff_log set state=1 where namespace='$(params.namespace)' and pipeline_id=$(params.build_no)"
+      git_author=`cat $(workspaces.common-workspace.path)/source-code/git-author`
+      git_msg=`cat $(workspaces.common-workspace.path)/source-code/git-msg`
+      change_app_records=`cat $(results.change-apps.path)`
+      mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+        "set names utf8;insert into pipeline_log(namespace,pipeline_id,sha,author,message,gamedata_url,gamedata_revision,changed_apps,state) \
+        values('$(params.namespace)',$(params.build_no),'${cur_pipeline_sha}','${git_author}',\"${git_msg}\",\
+        \"${full_gamedata_url}\",'$gamedata_revision','${change_app_records}',1)"
+
+      # 阻塞监控某个滚动更新的业务执行完毕
+      wait_rollup() {
+        ns=$k8s_namespace
+        dep=$1
+        ATTEMPTS=0
+        ROLLOUT_STATUS_CMD="kubectl rollout status $dep -n $ns"
+        # 等待指令执行成功返回或者100秒超时，如果指令返回错误也不管
+        until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 100 ]; do
+          $ROLLOUT_STATUS_CMD
+          ATTEMPTS=$((ATTEMPTS + 1))
+          sleep 2
+        done
+      }
+
+      # 滚动更新或者蓝绿部署某个服务
+      handle_hot_upgrade_app() {
+          app=$1
+          old_version=$2
+          version=$3
+
+          if [ "$(params.build_no)" != "1" ]; then
+            if [ "$old_version" = "$version" ]; then
+              echo "服务$app无改动，跳过热更新"
+              return
+            fi
+          fi
+
+          replica=3
+          extra_flags=""
+          case "$app" in
+              "match")
+                  replica=1
+                  ;;
+              "cron")
+                  replica=1
+                  ;;
+              "gm")
+                  replica=1
+                  extra_flags="--set logic.preSleep=10 --set logic.servicePorts.type=NodePort --set logic.servicePorts.servicePort=$(params.gm-port)"
+                  ;;
+              "reply")
+                  new_base_version=`echo $version|awk -F'.' '{print $3}'`
+
+                  if [ "$pre_pipeline_sha" = "" ]; then
+                    extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport1) --set containerPorts.uport=$(params.reply-uport1) \
+                        --set logic.container.rpcListenPort=$(params.reply-rpcport1) --set logic.container.statPort=$(params.reply-traceport1)"
+                    echo "第一次启动战斗服，跳过蓝绿"
+                    # 第一次启动从蓝色版本开始
+                    helm upgrade --install --version $version --set hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set deployLabels.color=blue -n $k8s_namespace $extra_flags $app-blue cicd/$app
+                    return
+                  fi
+
+                  kubectl -n $k8s_namespace get statefulsets -l app=$app 2>/dev/null
+                  spec_color=""
+                  latest_color=`kubectl -n $k8s_namespace get statefulsets -l app=$app 2>/dev/null|tail -n 1|awk -F' ' '{print $1}'|awk -F'-' '{print $2}'`
+                  case "${latest_color}" in
+                    blue)
+                        spec_color="green"
+                        echo "reply最近部署蓝色，指定为绿色"
+                        extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport2) --set containerPorts.uport=$(params.reply-uport2) \
+                            --set logic.container.rpcListenPort=$(params.reply-rpcport2) --set logic.container.statPort=$(params.reply-traceport2)"
+                        ;;
+                    green)
+                        spec_color="blue"
+                        echo "reply最近部署绿色，指定为蓝色"
+                        extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport1) --set containerPorts.uport=$(params.reply-uport1) \
+                            --set logic.container.rpcListenPort=$(params.reply-rpcport1) --set logic.container.statPort=$(params.reply-traceport1)"
+                        ;;
+                    *)
+                        echo "未找到reply最近部署颜色，指定为蓝色"
+                        spec_color="blue"
+                        extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport1) --set containerPorts.uport=$(params.reply-uport1) \
+                            --set logic.container.rpcListenPort=$(params.reply-rpcport1) --set logic.container.statPort=$(params.reply-traceport1)"
+                        ;;
+                  esac
+
+                  helm upgrade --install --version $version --set hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set deployLabels.color=$spec_color -n $k8s_namespace $extra_flags $app-$spec_color cicd/$app
+
+                  # 等待新版本启动完成
+                  wait_rollup statefulsets/reply-$spec_color
+
+                  # 老版本reply停止接客
+                  old_base_version=`echo $old_version|awk -F'.' '{print $3}'`
+                  image_version="$latest_color"
+                  broadcast_reply -ns=$(params.namespace) -msg="stop_service" -version=$image_version
+                  echo "老版本reply停止接客，老版本颜色：$latest_color，老版本：$old_version，老版本镜像：$latest_color"
+
+                  echo "true" > $(results.is-reply-upgrade.path)
+                  return
+                  ;;
+              "gateway")
+                  extra_flags="--set gateway.servicePorts.type=NodePort --set gateway.servicePorts.tcpServicePort=$(params.gateway-tport) \
+                    --set gateway.servicePorts.wsServicePort=$(params.gateway-wport)"
+
+                  new_base_version=`echo $version|awk -F'.' '{print $3}'`
+
+                  if [ "$pre_pipeline_sha" = "" ]; then
+                    # 切换流量入口
+                    echo "第一次启动网关，直接蓝版本，跳过蓝绿"
+                    helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set global.deployLabels.color=blue -n $k8s_namespace $extra_flags $app-blue cicd/$app-dep
+                    helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set global.deployLabels.color=blue -n $k8s_namespace $extra_flags $app-svc cicd/$app-svc
+                    return
+                  fi
+
+                  kubectl -n $k8s_namespace get deployment -l app=$app 2>/dev/null
+                  spec_color=""
+                  latest_color=`kubectl -n $k8s_namespace get deployment -l app=$app 2>/dev/null|tail -n 1|awk -F' ' '{print $1}'|awk -F'-' '{print $2}'`
+                  case "${latest_color}" in
+                    blue)
+                        spec_color="green"
+                        echo "gateway最近部署蓝色，指定为绿色"
+                        ;;
+                    green)
+                        spec_color="blue"
+                        echo "gateway最近部署绿色，指定为蓝色"
+                        ;;
+                    *)
+                        echo "未找到gateway最近部署颜色，指定为蓝色"
+                        spec_color="blue"
+                        ;;
+                  esac
+
+                  # 启动新版本gateway
+                  helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set global.deployLabels.color=$spec_color -n $k8s_namespace $extra_flags $app-$spec_color cicd/$app-dep
+                  # 等待新版本启动完毕，再切换流量入口
+                  wait_rollup deployment/gateway-$spec_color
+
+                  # 切换新版的流量入口
+                  helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                    --set replicaCount=$replica --set global.deployLabels.color=$spec_color -n $k8s_namespace $extra_flags $app-svc cicd/$app-svc
+
+                  echo "老版本gateway流量切换到新版，老版本颜色：$spec_color，老版本：$old_version"
+
+                  echo "true" > $(results.is-gateway-upgrade.path)
+                  return
+                  ;;
+              *)
+                  ;;
+          esac
+
+          echo "服务$app触发滚动更新"
+          set -x
+          helm upgrade --install --version $version \
+            --set hostPath=/data/$k8s_namespace --set replicaCount=$replica -n $k8s_namespace $extra_flags $app cicd/$app
+          set +x
+      }
+
+      # 遍历版本列表，滚动更新或者蓝绿部署
+      cat $version_list_file | while IFS="," read -r Ser LastVer NewVer Update; do
+      	echo "Ser: ${Ser}, LastVer: $LastVer, NewVer: $NewVer, Update: $Update "
+      	handle_hot_upgrade_app "$Ser" "$LastVer" "$NewVer"
+      done
+  - name: notify
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      DING_URL="https://oapi.dingtalk.com/robot/send?access_token=822db348044c2b75e89a0e6e7816fa09b39123228dd6cdec48f1d26cd37e11ad"
+      DING_URL=https://oapi.dingtalk.com/robot/send?access_token=884827f64ead1b21653025661cc31a8766c4b69e2f073dff6efd4494245f0924
+      md_file=$(workspaces.common-workspace.path)/source-code/ops/k8s/cicd/result_notify/result.md
+
+      set -x
+
+      eval "sed -i 's/namespace/$(params.namespace)/g' $md_file"
+      eval "sed -i 's/trigger_user/$(params.trigger_user)/g' $md_file"
+      eval "sed -i 's/cur_pipeline_id/$(params.build_no)/g' $md_file"
+      pre_pipeline_id=`cat $(results.pre-pipeline-id.path)`
+      eval "sed -i 's/pre_pipeline_id/${pre_pipeline_id}/g' $md_file"
+      eval "sed -i 's/branch/$(params.revision)/g' $md_file"
+
+      git_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      git_author=`cat $(workspaces.common-workspace.path)/source-code/git-author`
+      git_msg=`cat $(workspaces.common-workspace.path)/source-code/git-msg`
+      eval "sed -i 's/git_sha/${git_sha}/g' $md_file"
+      eval "sed -i 's/git_author/${git_author}/g' $md_file"
+      eval "sed -i 's#git_message#${git_msg}#g' $md_file"
+
+      full_gamedata_url=`cat $(results.gamedata-url.path)`
+      gamedata_revision=`cat $(results.gamedata-revision.path)`
+      eval "sed -i 's#gamedata_url#${full_gamedata_url}#g' $md_file"
+      eval "sed -i 's#gamedata_revision#${gamedata_revision}#g' $md_file"
+
+      change_app_records=`cat $(results.change-apps.path)`
+      if [ "$change_app_records" = "" ]; then
+        change_app_records="没有app代码变动"
+      fi
+      eval "sed -i 's/change_apps/$change_app_records/g' $md_file"
+
+      dbdiff_history=`mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd --skip-column-names -s -e "select concat(db_name,',',file_name) from dbdiff_log where \
+           namespace='$(params.namespace)' and pipeline_id=$(params.build_no)"`
+
+      change_dbdiff=""
+      if [ "$dbdiff_history" != "" ]; then
+        change_dbdiff1=""
+        for line in $dbdiff_history; do
+          db_name=`echo $line|awk -F',' '{print $1}'`
+          file_name=`echo $line|awk -F',' '{print $2}'`
+          change_dbdiff1="${change_dbdiff1}> **${db_name}：** ${file_name}  \n"
+        done
+        change_dbdiff=`echo ${change_dbdiff1}`
+      else
+        change_dbdiff="${change_dbdiff}> 数据库脚本无变动"
+      fi
+
+      echo >> $md_file
+      echo "$change_dbdiff" >> $md_file
+      MD_CONTENT=`cat $md_file`;
+      curl "$DING_URL" -H 'Content-Type: application/json' -d '{"msgtype":"markdown","markdown":{"title": "Alert cicd流水线完成","text":"'"$MD_CONTENT"'"}}'
+
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: football-cicd
+spec:
+  workspaces:
+    - name: common-workspace
+  params:
+  - name: revision
+    type: string
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+    default: "latest"
+  - name: registry_project
+    description: "仓库项目，镜像全名[$insecure_registry/$registry_project/`basename $packages`:$build_no]"
+  - name: trigger_user
+  - name: gamedata_url
+  - name: gateway-tport
+  - name: gateway-wport
+  - name: gm-port
+  - name: reply-tport1
+  - name: reply-uport1
+  - name: reply-rpcport1
+  - name: reply-traceport1
+  - name: reply-tport2
+  - name: reply-uport2
+  - name: reply-rpcport2
+  - name: reply-traceport2
+  tasks:
+  - name: clone-repo-task
+    taskRef:
+      name: clone-repo
+    params:
+      - name: revision
+        value: $(params.revision)
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-gateway
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/gateway"
+      - name: helm-packages
+        value: "ops/helm/v1/gateway-dep"
+      - name: helm-packages1
+        value: "ops/helm/v1/gateway-svc"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-reply
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/reply"
+      - name: helm-packages
+        value: "ops/helm/v1/reply"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-globalid
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/globalid"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/globalid"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-gm
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/gm"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/gm"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-account
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/account"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-activity
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/activity"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-bag
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/bag"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-charge
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/charge"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-cron
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/cron"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-friends
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/friends"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-game
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/game"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-lobby
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/lobby"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-log
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/log"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-mail
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/mail"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-market
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/market"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-match
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/match"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-message
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/message"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-pack
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/pack"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-ranklist
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/ranklist"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-reward
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/reward"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-shop
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/shop"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-task
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/task"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-team
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/team"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: wait-ci-result
+    taskRef:
+      name: wait-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: revision
+        value: $(params.revision)
+      - name: build_no
+        value: $(params.build_no)
+      - name: registry_project
+        value: $(params.registry_project)
+      - name: trigger_user
+        value: $(params.trigger_user)
+      - name: gamedata_url
+        value: $(params.gamedata_url)
+      - name: gateway-tport
+        value: $(params.gateway-tport)
+      - name: gateway-wport
+        value: $(params.gateway-wport)
+      - name: gm-port
+        value: $(params.gm-port)
+      - name: reply-tport1
+        value: $(params.reply-tport1)
+      - name: reply-uport1
+        value: $(params.reply-uport1)
+      - name: reply-rpcport1
+        value: $(params.reply-rpcport1)
+      - name: reply-traceport1
+        value: $(params.reply-traceport1)
+      - name: reply-tport2
+        value: $(params.reply-tport2)
+      - name: reply-uport2
+        value: $(params.reply-uport2)
+      - name: reply-rpcport2
+        value: $(params.reply-rpcport2)
+      - name: reply-traceport2
+        value: $(params.reply-traceport2)
+    workspaces:
+    - name: common-workspace
+      workspace: common-workspace
+    runAfter:
+    - build-account
+    - build-activity
+    - build-bag
+    - build-charge
+    - build-cron
+    - build-friends
+    - build-game
+    - build-gateway
+    - build-globalid
+    - build-gm
+    - build-lobby
+    - build-log
+    - build-mail
+    - build-market
+    - build-match
+    - build-message
+    - build-pack
+    - build-ranklist
+    - build-reply
+    - build-reward
+    - build-shop
+    - build-task
+    - build-team
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pipeline-binding
+spec:
+  params: 
+  - name: build_no
+    value: "$(body.build_no)"
+  - name: namespace
+    value: "$(body.namespace)"
+  - name: revision
+    value: "$(body.branch)"
+  - name: registry_project
+    value: "football_ci_$(body.namespace)"
+  - name: gamedata_url
+    value: "$(body.gamedata_url)"
+  - name: trigger_user
+    value: "$(body.trigger_user)"
+  - name: gateway-tport
+    value: "$(body.gateway-tport)"
+  - name: gateway-wport
+    value: "$(body.gateway-wport)"
+  - name: gm-port
+    value: "$(body.gm-port)"
+  - name: reply-tport1
+    value: "$(body.reply-tport1)"
+  - name: reply-uport1
+    value: "$(body.reply-uport1)"
+  - name: reply-rpcport1
+    value: "$(body.reply-rpcport1)"
+  - name: reply-traceport1
+    value: "$(body.reply-traceport1)"
+  - name: reply-tport2
+    value: "$(body.reply-tport2)"
+  - name: reply-uport2
+    value: "$(body.reply-uport2)"
+  - name: reply-rpcport2
+    value: "$(body.reply-rpcport2)"
+  - name: reply-traceport2
+    value: "$(body.reply-traceport2)"
+
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: pipeline-template
+spec:
+  params:
+  - name: registry_project
+    default: "likun"
+  - name: build_no
+  - name: revision
+  - name: namespace
+  - name: registry_project
+  - name: trigger_user
+  - name: gamedata_url
+  - name: gateway-tport
+  - name: gateway-wport
+  - name: gm-port
+  - name: reply-tport1
+  - name: reply-uport1
+  - name: reply-rpcport1
+  - name: reply-traceport1
+  - name: reply-tport2
+  - name: reply-uport2
+  - name: reply-rpcport2
+  - name: reply-traceport2
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: football-cicd-run-
+    spec:
+      serviceAccountName: build-bot
+      pipelineRef:
+        name: football-cicd
+#       podTemplate:
+#         securityContext:
+#           fsGroup: 65532
+      workspaces:
+        - name: common-workspace
+          persistentVolumeClaim:
+            claimName: build-cache
+      params:
+        - name: registry_project
+          value: $(tt.params.registry_project)
+        - name: revision
+          value: $(tt.params.revision)
+        - name: namespace
+          value: $(tt.params.namespace)
+        - name: build_no
+          value: $(tt.params.build_no)
+        - name: registry_project
+          value: "$(tt.params.registry_project)"
+        - name: gamedata_url
+          value: "$(tt.params.gamedata_url)"
+        - name: trigger_user
+          value: "$(tt.params.trigger_user)"
+        - name: gateway-tport
+          value: $(tt.params.gateway-tport)
+        - name: gateway-wport
+          value: $(tt.params.gateway-wport)
+        - name: gm-port
+          value: $(tt.params.gm-port)
+        - name: reply-tport1
+          value: $(tt.params.reply-tport1)
+        - name: reply-uport1
+          value: $(tt.params.reply-uport1)
+        - name: reply-rpcport1
+          value: $(tt.params.reply-rpcport1)
+        - name: reply-traceport1
+          value: $(tt.params.reply-traceport1)
+        - name: reply-tport2
+          value: $(tt.params.reply-tport2)
+        - name: reply-uport2
+          value: $(tt.params.reply-uport2)
+        - name: reply-rpcport2
+          value: $(tt.params.reply-rpcport2)
+        - name: reply-traceport2
+          value: $(tt.params.reply-traceport2)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-interceptor
+spec:
+  serviceAccountName: tekton-triggers-example-sa
+  triggers:
+    - name: http-trigger
+      bindings:
+        - ref: pipeline-binding
+      template:
+        ref: pipeline-template
+

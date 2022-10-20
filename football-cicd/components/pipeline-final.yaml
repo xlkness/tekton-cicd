@@ -1,0 +1,29 @@
+  finally:
+  - name: wait-ci-result
+    taskRef:
+      name: wait-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: registry_project
+        value: $(params.registry_project)
+      - name: gateway-tport
+        value: $(params.gateway-tport)
+      - name: gateway-wport
+        value: $(params.gateway-wport)
+      - name: gm-port
+        value: $(params.gm-port)
+      - name: reply-tport
+        value: $(params.reply-tport)
+      - name: reply-uport
+        value: $(params.reply-uport)
+      - name: reply-rpcport
+        value: $(params.reply-rpcport)
+      - name: reply-traceport
+        value: $(params.reply-traceport)
+    workspaces:
+    - name: common-workspace
+      workspace: common-workspace
+    runAfter:

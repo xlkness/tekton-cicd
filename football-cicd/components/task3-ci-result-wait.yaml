@@ -1,0 +1,475 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: wait-ci
+spec:
+  params:
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: revision
+  - name: gamedata_url
+    description: "配置表的分支链接"
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+  - name: trigger_user
+    description: 流水线触发的用户
+  - name: registry_project
+    description: "仓库项目，镜像全名[$insecure_registry/$registry_project/`basename $packages`:$build_no]"
+  - name: insecure_registry
+    description: Allows the user to push to an insecure registry that has been specified
+    default: "harbor.joynova.com:5443"
+  - name: gateway-tport
+    description: "大厅网关tcp服务端口"
+  - name: gateway-wport
+    description: "大厅网关websocket服务端口"
+  - name: gm-port
+    description: "gm服务端口"
+  - name: reply-tport1
+    description: "战斗服监听tcp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-uport1
+    description: "战斗服监听udp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-rpcport1
+    description: "战斗服监听rpc端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-traceport1
+    description: "战斗服prometheus监听端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-tport2
+    description: "战斗服监听tcp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-uport2
+    description: "战斗服监听udp端口，因为hostnetwork部署，可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-rpcport2
+    description: "战斗服监听rpc端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  - name: reply-traceport2
+    description: "战斗服prometheus监听端口，因为hostnetwork部署，所以可能会和宿主机端口冲突，需要手工指定"
+  workspaces:
+    - name: common-workspace
+  results:
+    - name: is-gateway-upgrade
+      description: "gateway是否触发热更"
+    - name: is-reply-upgrade
+      description: "reply是否触发热更"
+    - name: change-apps
+    - name: pre-pipeline-sha
+      description: "上一次流水线的代码版本"
+    - name: pre-pipeline-id
+      description: "上一次流水线的编号"
+    - name: gamedata-url
+    - name: gamedata-revision
+  steps:
+  - name: wait-ci-result
+    image: harbor.joynova.com:5443/tools/k8s8xctl:latest
+    script: |
+      # 查询本次构建发生变动的app
+      change_apps=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+              "select app from app_log where namespace='$(params.namespace)' and pipeline_id=$(params.build_no) order by app asc" --skip-column-names -s`
+      echo "----------------"
+
+      change_app_records=""
+      if [ "$change_apps" != "" ]; then
+        change_app_records1=""
+        for line in $change_apps; do
+          echo "${line} app changed with new version:v0.0.$(params.build_no)"
+          change_app_records1="${change_app_records1}${line},"
+        done
+        change_app_records=`echo ${change_app_records1}`
+      else
+        echo "no app changed!"
+      fi
+
+      printf "%s" $change_app_records > $(results.change-apps.path)
+
+      echo "----------------"
+
+      pre_pipeline_sha=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd --skip-column-names -s -e \
+                    "select sha from pipeline_log where namespace='$(params.namespace)' order by pipeline_id desc limit 0,1"`
+      pre_pipeline_id=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd --skip-column-names -s -e \
+                    "select pipeline_id from pipeline_log where namespace='$(params.namespace)' order by pipeline_id desc limit 0,1"`
+      printf "%s" $pre_pipeline_sha > $(results.pre-pipeline-sha.path)
+      printf "%s" $pre_pipeline_id > $(results.pre-pipeline-id.path)
+
+      # 收集helm版本结果
+      pipeline_record_path=$(workspaces.common-workspace.path)/ci-result/pipeline-log/pipeline-$(params.build_no)
+      mkdir -p $pipeline_record_path
+      rm -rf $pipeline_record_path/*
+      for result in `ls $(workspaces.common-workspace.path)/source-code/helm-version-list`; do
+        cat $(workspaces.common-workspace.path)/source-code/helm-version-list/$result >> $pipeline_record_path/version.list
+      done
+      echo "helm部署版本列表数据："
+      cat $pipeline_record_path/version.list
+
+      # 骚操作，用ubuntu镜像的git工具切到pre提交，下一个step编译
+      cd $(workspaces.common-workspace.path)/source-code
+      pre_sha=`cat $(results.pre-pipeline-sha.path)`
+      if [ "$pre_sha" != "" ]; then
+        echo "切换源代码到上一次提交，用于下一个step构建dbsync工具"
+        git checkout $pre_sha
+      fi
+  - name: build-pre-db-sync
+    image: golang:1.18.1
+    workingDir: $(workspaces.common-workspace.path)/source-code
+    script: |
+      ls $(workspaces.common-workspace.path)/source-code/tools/dev_tools/db_sync_new
+
+      pre_sha=`cat $(results.pre-pipeline-sha.path)`
+      cur_pipeline_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      if [ "$pre_sha" != "" ]; then
+        if [ "$pre_sha" != "$cur_pipeline_sha" ]; then
+          echo "上次提交sha：$pre_sha，当前提交sha：$cur_pipeline_sha，有代码变动，编译旧版db_sync"
+          cd $(workspaces.common-workspace.path)/source-code/tools/dev_tools
+          go env -w GOCACHE="$(workspaces.common-workspace.path)/ci-cache/gocache"
+          go env -w GOMODCACHE="$(workspaces.common-workspace.path)/ci-cache/gomodcache"
+          go build -v -o db_sync_old db_sync.go
+        fi
+      fi
+  - name: cd
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      echo "切换源码到最新提交"
+      cd $(workspaces.common-workspace.path)/source-code
+      git checkout $(params.revision)
+      cd -
+
+      set +x
+
+      k8s_namespace="football-$(params.namespace)"
+      version_list_file=$(workspaces.common-workspace.path)/ci-result/pipeline-log/pipeline-$(params.build_no)/version.list
+      cur_pipeline_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      pre_pipeline_sha=`cat $(results.pre-pipeline-sha.path)`
+
+      # 重读配置表
+      set -x
+      full_gamedata_url=http://192.168.1.134:3690/svn/ma83/soccer_2/gameData/$(params.gamedata_url)/server
+      svn co $full_gamedata_url /tmp/gamedata --username likun --password likun
+      gamedata_revision=`cd /tmp/gamedata && svn info | grep Revision | sed 's/Revision: //g'`
+      echo "配置表链接:$full_gamedata_url"
+      echo "配置表最新版本:$gamedata_revision"
+      printf "%s" $full_gamedata_url > $(results.gamedata-url.path)
+      printf "%s" $gamedata_revision > $(results.gamedata-revision.path)
+      rm -rf ~/.ssh && mkdir ~/.ssh
+      ssh-keygen -t rsa -C "tekton-cicd@joynova.com.cn" -P "" -f ~/.ssh/id-rsa
+      #rm -rf /tmp/gamedata/.svn
+      # 先验证host
+      eval sshpass -p dev123 ssh -o StrictHostKeyChecking=no root@192.168.1.141 "echo"
+      # 再scp不会报错
+      eval sshpass -p dev123 scp -r /tmp/gamedata root@192.168.1.141:/data/$k8s_namespace
+      set +e
+      curl 192.168.1.141:$(params.gm-port)/gm/reload_csv?gm_id=tekton-cicd
+      set -e
+      set +x
+
+      # 对比数据库diff
+      if [ "$pre_pipeline_sha" != "$cur_pipeline_sha" ]; then
+          echo "代码版本与上次不一致，进行数据库diff生成：$pre_pipeline_sha -> $cur_pipeline_sha"
+          # 比对数据库diff
+          old_version_db="tekton_cicd_comp_db_$(params.namespace)_old"
+          new_version_db="tekton_cicd_comp_db_$(params.namespace)_new"
+          # 先清空数据库
+          echo "清空对比旧数据库$old_version_db"
+          echo "清空对比新数据库$new_version_db"
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "DROP DATABASE IF EXISTS $old_version_db;"
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "DROP DATABASE IF EXISTS $new_version_db;"
+          # 创建新旧数据库
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "CREATE DATABASE IF NOT EXISTS $old_version_db DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_general_ci;"
+          mysql -hmysql-22 -P3307 -uroot -pdev123 -e "CREATE DATABASE IF NOT EXISTS $new_version_db DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_general_ci;"
+
+          diffout=$(workspaces.common-workspace.path)/ci-result/pipeline-log/pipeline-$(params.build_no)/dbscript
+
+          # 直接先恢复新版本的数据库
+          $(workspaces.common-workspace.path)/source-code/tools/dev_tools/db_sync_new -a mysql-22:3307 -u root -p dev123 -d $new_version_db
+
+          if [ "$pre_pipeline_sha" != "" ]; then
+            echo "不是第一次构建，且当前流水线代码版本与上次不一致，恢复旧数据库作对比：$pre_pipeline_sha -> $cur_pipeline_sha"
+            # 不是第一次构建，恢复老版本数据库
+            /$(workspaces.common-workspace.path)/source-code/tools/dev_tools/db_sync_old -a mysql-22:3307 -u root -p dev123 -d $old_version_db
+          elif [ "$pre_pipeline_sha" = "" ]; then
+            echo "第一次构建，清空dbdiff目录，防止旧的调试数据影响"
+            rm -rf $diffout/*
+          fi
+
+          # 开始比对新旧数据库
+          mkdir -p $diffout
+          dbdiff -ip mysql-22:3307 -u root -pwd dev123 \
+                  -od $old_version_db -nd $new_version_db -dir $diffout -mode shard -cm "$(params.build_no)"
+
+          # 将diff写入数据库存储
+          for diffdir in $(ls -l ${diffout}/ | awk '/^d/ {print $9}'); do
+            if [ "`ls ${diffout}/$diffdir|wc -l`" = "0" ]; then
+              echo "数据库$diffdir未产生数据库diff，跳过"
+              continue
+            fi
+
+            db_name="$diffdir"
+            file_name=`ls ${diffout}/$diffdir|head -n 1`
+            file_content="`cat ${diffout}/$diffdir/$file_name`"
+            echo "数据库$diffdir产生增量文件$file_name"
+            mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd -e "set names utf8;insert into dbdiff_log(db_name,namespace,pipeline_id,pre_sha,cur_sha,file_name,content) \
+              values('$db_name', '$(params.namespace)', '$(params.build_no)', '$pre_pipeline_sha', '$cur_pipeline_sha', '$file_name', \"${file_content}\");"
+          done
+
+          # 从数据库查询全量脚本并应用
+          echo "开始应用脚本全量到数据库"
+          for diffdir in $(ls -l ${diffout}/ | awk '/^d/ {print $9}'); do
+              # fixme: 当前流水线在后续失败了，但是现在已经应用了数据库diff
+              dbdiff_history=`mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd --skip-column-names -s -e "select file_name from dbdiff_log where \
+                   namespace='$(params.namespace)' and db_name='$diffdir' and (pipeline_id=$(params.build_no) or state=1) order by pipeline_id asc"`
+
+              if [ "$dbdiff_history" != "" ]; then
+                mkdir -p /tmp/recover_dbdiff/$diffdir
+                # 这里居然不能用回车格式，否则解析不出？？
+                echo "${dbdiff_history}"|while read line; do \
+                  file_name=`echo $line|awk -F',' '{print $1}'`; \
+                  content=`mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd --skip-column-names -s -e "select content from dbdiff_log where \
+                        namespace='$(params.namespace)' and db_name='$diffdir' and file_name='$file_name'"`; \
+                  echo "${content}" > /tmp/recover_dbdiff/$diffdir/$file_name; done
+              else
+                echo "${diffdir}数据库脚本都没有改动"
+              fi
+              db_name="football_$(params.namespace)_$diffdir"
+
+              if [ "$dbdiff_history" != "" ]; then
+                if [ "$pre_pipeline_sha" = "" ]; then
+                  echo "流水线第一次构建，尝试清空数据库$db_name，再应用diff全量脚本"
+                  mysql -hmysql-22 -P3307 -uroot -pdev123 -e "DROP DATABASE IF EXISTS $db_name;" 2>/dev/null
+                  mysql -hmysql-22 -P3307 -uroot -pdev123 -e "CREATE DATABASE IF NOT EXISTS $db_name \
+                    DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_general_ci;" 2>/dev/null
+                fi
+                echo "开始恢复数据库$diffdir，diff脚本如下："
+                ls /tmp/recover_dbdiff/$diffdir
+                flyway -locations=filesystem:/tmp/recover_dbdiff/$diffdir migrate \
+                          -encoding=utf8 -driver=com.mysql.cj.jdbc.Driver \
+                          -url=jdbc:mysql://mysql-22:3307/$db_name \
+                          -user=root -password=dev123
+              fi
+          done
+      fi
+
+      echo "192.168.1.146 harbor.joynova.com" >> /etc/hosts
+      helm repo add --ca-file /cert/ca.crt --cert-file /cert/harbor.joynova.com.crt --key-file /cert/harbor.joynova.com.key \
+          cicd  https://$(params.insecure_registry)/chartrepo/$(params.registry_project) --username=admin --password=dev123
+      helm repo update
+
+      # 修改app构建状态，表示流水线正确执行完毕，后续滚动更新流程就不关心结果了
+      mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+                "update app_log set pipeline_state=1 where namespace='$(params.namespace)' and pipeline_id=$(params.build_no)"
+      mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+                "update dbdiff_log set state=1 where namespace='$(params.namespace)' and pipeline_id=$(params.build_no)"
+      git_author=`cat $(workspaces.common-workspace.path)/source-code/git-author`
+      git_msg=`cat $(workspaces.common-workspace.path)/source-code/git-msg`
+      change_app_records=`cat $(results.change-apps.path)`
+      mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+        "set names utf8;insert into pipeline_log(namespace,pipeline_id,sha,author,message,gamedata_url,gamedata_revision,changed_apps,state) \
+        values('$(params.namespace)',$(params.build_no),'${cur_pipeline_sha}','${git_author}',\"${git_msg}\",\
+        \"${full_gamedata_url}\",'$gamedata_revision','${change_app_records}',1)"
+
+      # 阻塞监控某个滚动更新的业务执行完毕
+      wait_rollup() {
+        ns=$k8s_namespace
+        dep=$1
+        ATTEMPTS=0
+        ROLLOUT_STATUS_CMD="kubectl rollout status $dep -n $ns"
+        # 等待指令执行成功返回或者100秒超时，如果指令返回错误也不管
+        until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 100 ]; do
+          $ROLLOUT_STATUS_CMD
+          ATTEMPTS=$((ATTEMPTS + 1))
+          sleep 2
+        done
+      }
+
+      # 滚动更新或者蓝绿部署某个服务
+      handle_hot_upgrade_app() {
+          app=$1
+          old_version=$2
+          version=$3
+
+          if [ "$(params.build_no)" != "1" ]; then
+            if [ "$old_version" = "$version" ]; then
+              echo "服务$app无改动，跳过热更新"
+              return
+            fi
+          fi
+
+          replica=3
+          extra_flags=""
+          case "$app" in
+              "match")
+                  replica=1
+                  ;;
+              "cron")
+                  replica=1
+                  ;;
+              "gm")
+                  replica=1
+                  extra_flags="--set logic.preSleep=10 --set logic.servicePorts.type=NodePort --set logic.servicePorts.servicePort=$(params.gm-port)"
+                  ;;
+              "reply")
+                  new_base_version=`echo $version|awk -F'.' '{print $3}'`
+
+                  if [ "$pre_pipeline_sha" = "" ]; then
+                    extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport1) --set containerPorts.uport=$(params.reply-uport1) \
+                        --set logic.container.rpcListenPort=$(params.reply-rpcport1) --set logic.container.statPort=$(params.reply-traceport1)"
+                    echo "第一次启动战斗服，跳过蓝绿"
+                    # 第一次启动从蓝色版本开始
+                    helm upgrade --install --version $version --set hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set deployLabels.color=blue -n $k8s_namespace $extra_flags $app-blue cicd/$app
+                    return
+                  fi
+
+                  kubectl -n $k8s_namespace get statefulsets -l app=$app 2>/dev/null
+                  spec_color=""
+                  latest_color=`kubectl -n $k8s_namespace get statefulsets -l app=$app 2>/dev/null|tail -n 1|awk -F' ' '{print $1}'|awk -F'-' '{print $2}'`
+                  case "${latest_color}" in
+                    blue)
+                        spec_color="green"
+                        echo "reply最近部署蓝色，指定为绿色"
+                        extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport2) --set containerPorts.uport=$(params.reply-uport2) \
+                            --set logic.container.rpcListenPort=$(params.reply-rpcport2) --set logic.container.statPort=$(params.reply-traceport2)"
+                        ;;
+                    green)
+                        spec_color="blue"
+                        echo "reply最近部署绿色，指定为蓝色"
+                        extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport1) --set containerPorts.uport=$(params.reply-uport1) \
+                            --set logic.container.rpcListenPort=$(params.reply-rpcport1) --set logic.container.statPort=$(params.reply-traceport1)"
+                        ;;
+                    *)
+                        echo "未找到reply最近部署颜色，指定为蓝色"
+                        spec_color="blue"
+                        extra_flags="--set logic.use_public_ip=false --set containerPorts.tport=$(params.reply-tport1) --set containerPorts.uport=$(params.reply-uport1) \
+                            --set logic.container.rpcListenPort=$(params.reply-rpcport1) --set logic.container.statPort=$(params.reply-traceport1)"
+                        ;;
+                  esac
+
+                  helm upgrade --install --version $version --set hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set deployLabels.color=$spec_color -n $k8s_namespace $extra_flags $app-$spec_color cicd/$app
+
+                  # 等待新版本启动完成
+                  wait_rollup statefulsets/reply-$spec_color
+
+                  # 老版本reply停止接客
+                  old_base_version=`echo $old_version|awk -F'.' '{print $3}'`
+                  image_version="$latest_color"
+                  broadcast_reply -ns=$(params.namespace) -msg="stop_service" -version=$image_version
+                  echo "老版本reply停止接客，老版本颜色：$latest_color，老版本：$old_version，老版本镜像：$latest_color"
+
+                  echo "true" > $(results.is-reply-upgrade.path)
+                  return
+                  ;;
+              "gateway")
+                  extra_flags="--set gateway.servicePorts.type=NodePort --set gateway.servicePorts.tcpServicePort=$(params.gateway-tport) \
+                    --set gateway.servicePorts.wsServicePort=$(params.gateway-wport)"
+
+                  new_base_version=`echo $version|awk -F'.' '{print $3}'`
+
+                  if [ "$pre_pipeline_sha" = "" ]; then
+                    # 切换流量入口
+                    echo "第一次启动网关，直接蓝版本，跳过蓝绿"
+                    helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set global.deployLabels.color=blue -n $k8s_namespace $extra_flags $app-blue cicd/$app-dep
+                    helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set global.deployLabels.color=blue -n $k8s_namespace $extra_flags $app-svc cicd/$app-svc
+                    return
+                  fi
+
+                  kubectl -n $k8s_namespace get deployment -l app=$app 2>/dev/null
+                  spec_color=""
+                  latest_color=`kubectl -n $k8s_namespace get deployment -l app=$app 2>/dev/null|tail -n 1|awk -F' ' '{print $1}'|awk -F'-' '{print $2}'`
+                  case "${latest_color}" in
+                    blue)
+                        spec_color="green"
+                        echo "gateway最近部署蓝色，指定为绿色"
+                        ;;
+                    green)
+                        spec_color="blue"
+                        echo "gateway最近部署绿色，指定为蓝色"
+                        ;;
+                    *)
+                        echo "未找到gateway最近部署颜色，指定为蓝色"
+                        spec_color="blue"
+                        ;;
+                  esac
+
+                  # 启动新版本gateway
+                  helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                      --set replicaCount=$replica --set global.deployLabels.color=$spec_color -n $k8s_namespace $extra_flags $app-$spec_color cicd/$app-dep
+                  # 等待新版本启动完毕，再切换流量入口
+                  wait_rollup deployment/gateway-$spec_color
+
+                  # 切换新版的流量入口
+                  helm upgrade --install --version $version --set gateway.hostPath=/data/$k8s_namespace \
+                    --set replicaCount=$replica --set global.deployLabels.color=$spec_color -n $k8s_namespace $extra_flags $app-svc cicd/$app-svc
+
+                  echo "老版本gateway流量切换到新版，老版本颜色：$spec_color，老版本：$old_version"
+
+                  echo "true" > $(results.is-gateway-upgrade.path)
+                  return
+                  ;;
+              *)
+                  ;;
+          esac
+
+          echo "服务$app触发滚动更新"
+          set -x
+          helm upgrade --install --version $version \
+            --set hostPath=/data/$k8s_namespace --set replicaCount=$replica -n $k8s_namespace $extra_flags $app cicd/$app
+          set +x
+      }
+
+      # 遍历版本列表，滚动更新或者蓝绿部署
+      cat $version_list_file | while IFS="," read -r Ser LastVer NewVer Update; do
+      	echo "Ser: ${Ser}, LastVer: $LastVer, NewVer: $NewVer, Update: $Update "
+      	handle_hot_upgrade_app "$Ser" "$LastVer" "$NewVer"
+      done
+  - name: notify
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      DING_URL="https://oapi.dingtalk.com/robot/send?access_token=822db348044c2b75e89a0e6e7816fa09b39123228dd6cdec48f1d26cd37e11ad"
+      DING_URL=https://oapi.dingtalk.com/robot/send?access_token=884827f64ead1b21653025661cc31a8766c4b69e2f073dff6efd4494245f0924
+      md_file=$(workspaces.common-workspace.path)/source-code/ops/k8s/cicd/result_notify/result.md
+
+      set -x
+
+      eval "sed -i 's/namespace/$(params.namespace)/g' $md_file"
+      eval "sed -i 's/trigger_user/$(params.trigger_user)/g' $md_file"
+      eval "sed -i 's/cur_pipeline_id/$(params.build_no)/g' $md_file"
+      pre_pipeline_id=`cat $(results.pre-pipeline-id.path)`
+      eval "sed -i 's/pre_pipeline_id/${pre_pipeline_id}/g' $md_file"
+      eval "sed -i 's/branch/$(params.revision)/g' $md_file"
+
+      git_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      git_author=`cat $(workspaces.common-workspace.path)/source-code/git-author`
+      git_msg=`cat $(workspaces.common-workspace.path)/source-code/git-msg`
+      eval "sed -i 's/git_sha/${git_sha}/g' $md_file"
+      eval "sed -i 's/git_author/${git_author}/g' $md_file"
+      eval "sed -i 's#git_message#${git_msg}#g' $md_file"
+
+      full_gamedata_url=`cat $(results.gamedata-url.path)`
+      gamedata_revision=`cat $(results.gamedata-revision.path)`
+      eval "sed -i 's#gamedata_url#${full_gamedata_url}#g' $md_file"
+      eval "sed -i 's#gamedata_revision#${gamedata_revision}#g' $md_file"
+
+      change_app_records=`cat $(results.change-apps.path)`
+      if [ "$change_app_records" = "" ]; then
+        change_app_records="没有app代码变动"
+      fi
+      eval "sed -i 's/change_apps/$change_app_records/g' $md_file"
+
+      dbdiff_history=`mysql -hmysql-22 -P3307 -uroot -pdev123 -Dtekton-cicd --skip-column-names -s -e "select concat(db_name,',',file_name) from dbdiff_log where \
+           namespace='$(params.namespace)' and pipeline_id=$(params.build_no)"`
+
+      change_dbdiff=""
+      if [ "$dbdiff_history" != "" ]; then
+        change_dbdiff1=""
+        for line in $dbdiff_history; do
+          db_name=`echo $line|awk -F',' '{print $1}'`
+          file_name=`echo $line|awk -F',' '{print $2}'`
+          change_dbdiff1="${change_dbdiff1}> **${db_name}：** ${file_name}  \n"
+        done
+        change_dbdiff=`echo ${change_dbdiff1}`
+      else
+        change_dbdiff="${change_dbdiff}> 数据库脚本无变动"
+      fi
+
+      echo >> $md_file
+      echo "$change_dbdiff" >> $md_file
+      MD_CONTENT=`cat $md_file`;
+      curl "$DING_URL" -H 'Content-Type: application/json' -d '{"msgtype":"markdown","markdown":{"title": "Alert cicd流水线完成","text":"'"$MD_CONTENT"'"}}'
+

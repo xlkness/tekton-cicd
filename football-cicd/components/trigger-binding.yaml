@@ -1,0 +1,41 @@
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pipeline-binding
+spec:
+  params: 
+  - name: build_no
+    value: "$(body.build_no)"
+  - name: namespace
+    value: "$(body.namespace)"
+  - name: revision
+    value: "$(body.branch)"
+  - name: registry_project
+    value: "football_ci_$(body.namespace)"
+  - name: gamedata_url
+    value: "$(body.gamedata_url)"
+  - name: trigger_user
+    value: "$(body.trigger_user)"
+  - name: gateway-tport
+    value: "$(body.gateway-tport)"
+  - name: gateway-wport
+    value: "$(body.gateway-wport)"
+  - name: gm-port
+    value: "$(body.gm-port)"
+  - name: reply-tport1
+    value: "$(body.reply-tport1)"
+  - name: reply-uport1
+    value: "$(body.reply-uport1)"
+  - name: reply-rpcport1
+    value: "$(body.reply-rpcport1)"
+  - name: reply-traceport1
+    value: "$(body.reply-traceport1)"
+  - name: reply-tport2
+    value: "$(body.reply-tport2)"
+  - name: reply-uport2
+    value: "$(body.reply-uport2)"
+  - name: reply-rpcport2
+    value: "$(body.reply-rpcport2)"
+  - name: reply-traceport2
+    value: "$(body.reply-traceport2)"

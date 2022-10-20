@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: build-cache
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 40Gi
+  # 拉取、构建代码的pvc放在主节点
+  storageClassName: default-85-sc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: docker-cache
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 30Gi
+  # docker缓存的pvc放在另一个节点的ssd盘
+  storageClassName: ssd-86

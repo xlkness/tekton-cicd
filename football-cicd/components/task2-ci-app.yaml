@@ -1,0 +1,284 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: app-ci
+spec:
+  params:
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: packages
+    description: "main包入口，相对项目路径的，例如cmd/micro/account/cmd/all_in_one"
+  - name: helm-packages
+    description: helm部署包的入口，相对项目路径的，例如ops/helm/v1/lobby-rollup/gm
+  - name: helm-packages1
+    description: helm部署包的另一入口，比如某些项目需要两个部署包的，例如gateway-dep和gateway-svc
+    default: ""
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+    default: "latest"
+  - name: mysql-host
+    default: "mysql-22"
+  - name: registry_project
+    description: "仓库项目，镜像全名[$insecure_registry/$registry_project/`basename $packages`:$build_no]"
+  - name: insecure_registry
+    description: Allows the user to push to an insecure registry that has been specified
+    default: "harbor.joynova.com:5443"
+  workspaces:
+    - name: common-workspace
+  results:
+  - name: binary-md5
+    description: 二进制的md5，与上次的值比对，相同则服务代码无改动
+  - name: binary-md5-changed
+  - name: helm-md5
+    description: helm部署包目录的md5，目录改动需要重新打镜像
+  - name: helm-old-version
+    description: helm部署的旧版本
+  steps:
+  - name: code-build
+    image: golang:1.18.1
+    script: |
+      app=`basename $(params.packages)`
+      echo "compile application:"$app
+      go env -w GOPROXY="https://goproxy.cn,https://goproxy.io,direct"
+      go env -w GOPRIVATE=joynova.com
+      go env -w GOINSECURE=joynova.com
+      cd $(workspaces.common-workspace.path)/source-code/$(params.packages)
+      pwd
+      echo "go mod cache path:"
+      ls $GOMODCACHE
+      echo "==================="
+      go build -v -trimpath -buildvcs=false
+      echo "md5 sum:"`md5sum $app`
+      cur_md5=`md5sum $app | awk '{print $1}'`
+      printf "%s" "${cur_md5}" > $(results.binary-md5.path)
+  - name: check-binary-change
+    image: harbor.joynova.com:5443/tools/k8s8xctl:latest
+    script: |
+      app=`basename $(params.packages)`
+      query_app_old_info=`mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd --skip-column-names -s -e \
+              "select concat(binary_md5,',',helm_pack_md5,',',helm_tag) from app_log where namespace='$(params.namespace)' \
+              and app='${app}' and pipeline_state=1 order by pipeline_id desc limit 0,1"`
+      old_md5=`echo $query_app_old_info|awk -F',' '{print $1}'`
+      old_helm_md5=`echo $query_app_old_info|awk -F',' '{print $2}'`
+      old_helm_version=`echo $query_app_old_info|awk -F',' '{print $3}'`
+      cur_md5=`cat $(results.binary-md5.path)`
+      echo "old md5:"$old_md5
+      echo "cur md5:"$cur_md5
+      if [ "${old_md5}" = "${cur_md5}" ]; then
+        echo "false" > $(results.binary-md5-changed.path)
+      else
+        echo "true" > $(results.binary-md5-changed.path)
+      fi
+
+      # 检查helm部署包是否改动
+      helm_pack_md5=`find $(workspaces.common-workspace.path)/source-code/$(params.helm-packages) \
+        -type f -name "*" | sort | xargs md5sum |md5sum|awk -F' ' '{print $1}'`
+      if [ "$(params.helm-packages1)" != "" ]; then
+        helm_pack1_md5=`find $(workspaces.common-workspace.path)/source-code/$(params.helm-packages1) \
+                -type f -name "*" | sort | xargs md5sum |md5sum|awk -F' ' '{print $1}'`
+        helm_pack_md5=`echo "$helm_pack_md5$helm_pack1_md5"|md5sum|awk -F' ' '{print $1}'`
+      fi
+
+      echo "old helm md5:"$old_helm_md5
+      echo "new helm md5:"$helm_pack_md5
+      if [ "${old_helm_md5}" != "${helm_pack_md5}" ]; then
+        echo "true" > $(results.binary-md5-changed.path)
+      fi
+      echo "${helm_pack_md5}" > $(results.helm-md5.path)
+      echo "${old_helm_version}" > $(results.helm-old-version.path)
+  - name: image-build
+    image: docker.io/library/docker:stable@sha256:18ff92d3d31725b53fa6633d60bed323effb6d5d4588be7b547078d384e0d4bf
+    script: |
+      echo "192.168.1.14 joynova.com" >> /etc/hosts
+      echo "192.168.1.146 harbor.joynova.com" >> /etc/hosts
+      if [ `cat $(results.binary-md5-changed.path)` = "false" ]; then
+        echo "代码无改动，跳过镜像构建"
+        exit 0
+      fi
+      docker images
+      cd $(workspaces.common-workspace.path)/source-code/$(params.packages)
+      app=`basename $(params.packages)`
+
+      # 没有Dockerfile，就是微服务，dockerfile在上级目录
+      git_sha=`cat $(workspaces.common-workspace.path)/source-code/git-sha`
+      if ! test -f Dockerfile; then
+        cp ../docker_entrypoint.sh .
+        cp ../Dockerfile .
+        eval sed -i 's/application/${app}/g' Dockerfile
+        eval sed -i 's/application/${app}/g' docker_entrypoint.sh
+        eval sed -i 's/gitsha/${git_sha}/g' Dockerfile
+      fi
+
+      echo "docker build context:"
+      ls .
+
+      # 构建镜像
+      docker build -f Dockerfile -t "$(params.insecure_registry)/$(params.registry_project)/$app:v$(params.build_no)" .
+      # 查看所有镜像
+      docker images
+      # 推送镜像
+      docker push $(params.insecure_registry)/$(params.registry_project)/$app:v$(params.build_no)
+
+      set +e
+
+      # 只保留最近2个镜像
+      old_image_version=`expr $(params.build_no) - 2`
+      echo "删除旧镜像:$(params.insecure_registry)/$(params.registry_project)/$app:v$old_image_version"
+      docker rmi $(params.insecure_registry)/$(params.registry_project)/$app:v$old_image_version
+      for v in {1..$(params.build_no)}; do
+        history_image_version=v$v
+        docker rmi $(params.insecure_registry)/$(params.registry_project)/$app:$history_image_version
+      done
+      # 删除虚悬镜像释放空间
+      none_images=`docker images -q -f dangling=true`
+      for none_image in $none_images; do
+      	docker rmi -f $none_image
+      done
+  - name: helm-build
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      if [ `cat $(results.binary-md5-changed.path)` = "false" ]; then
+        echo "代码无改动，跳过helm包构建"
+        exit 0
+      fi
+
+      set -xe
+
+      # 添加helm仓库
+      helm repo add --ca-file /cert/ca.crt --cert-file /cert/harbor.joynova.com.crt --key-file /cert/harbor.joynova.com.key \
+              cicd  https://$(params.insecure_registry)/chartrepo/$(params.registry_project) --username=admin --password=dev123
+      mkdir -p /tmp/helm-output
+
+      app=`basename $(params.packages)`
+
+      helm_package_template=/tmp/helm_package_template
+
+      # 拷贝helm模板包，此时这个仓库代码是多pod并行读的，不拷贝出去搞会出并发问题
+      cp -rf $(workspaces.common-workspace.path)/source-code/$(params.helm-packages) /tmp/helm_package_template
+
+      # 修改helm配置文件参数
+      eval sed -i 's,r_name,${app},g' $helm_package_template/Chart.yaml
+      eval sed -i 's,r_version,$(params.build_no),g' $helm_package_template/Chart.yaml
+      app_repo_url=$(params.insecure_registry)\/$(params.registry_project)\/$app
+      # app_repo_url1=${app_repo_url//\//\\/} #这个写法要报错
+      eval sed -i 's,r_repo,${app_repo_url},g' $helm_package_template/values.yaml
+      eval sed -i 's,r_tag,v$(params.build_no),g' $helm_package_template/values.yaml
+      eval sed -i 's,r_busy,harbor.joynova.com:5443\/tools\/busybox:v0.0.2,g' $helm_package_template/values.yaml
+
+      helm package $helm_package_template -d /tmp/helm-output
+
+      # 如果存在第二个helm部署包，也构建出来
+      if [ "$(params.helm-packages1)" != "" ]; then
+        helm_package_template1=/tmp/helm_package_template1
+        cp -rf $(workspaces.common-workspace.path)/source-code/$(params.helm-packages1) /tmp/helm_package_template1
+        eval sed -i 's,r_version,$(params.build_no),g' $helm_package_template1/Chart.yaml
+        eval sed -i 's,r_name,${app},g' $helm_package_template/Chart.yaml
+        eval sed -i 's,r_repo,${app_repo_url},g' $helm_package_template1/values.yaml
+        eval sed -i 's,r_tag,v$(params.build_no),g' $helm_package_template1/values.yaml
+        eval sed -i 's,r_busy,harbor.joynova.com:5443\/tools\/busybox:v0.0.2,g' $helm_package_template1/values.yaml
+        helm package $helm_package_template1 -d /tmp/helm-output
+      fi
+
+      # 查看helm读取插件的目录，调试信息
+      helm env|grep HELM_DATA_HOME
+
+      # 推送镜像
+      for tar_file in `ls /tmp/helm-output`; do
+        helm cm-push --ca-file /cert/ca.crt --cert-file /cert/harbor.joynova.com.crt --key-file /cert/harbor.joynova.com.key \
+               /tmp/helm-output/$tar_file cicd
+      done
+  - name: post-build
+    image: harbor.joynova.com:5443/tools/k8s8xctl:latest
+    script: |
+      app=`basename $(params.packages)`
+      old_helm_version=`cat $(results.helm-old-version.path)`
+      helm_new_tag=$old_helm_version
+      is_upgrade=0
+      if [ `cat $(results.binary-md5-changed.path)` = "true" ]; then
+        echo "代码改动，存储新md5值到数据库"
+        md5=`cat $(results.binary-md5.path)`
+        helm_md5=`cat $(results.helm-md5.path)`
+        helm_new_tag=0.0.$(params.build_no)
+        is_upgrade=1
+        mysql -uroot -pdev123 -hmysql-22 -P3307 -Dtekton-cicd -e \
+                "insert into app_log(namespace,app,binary_md5,helm_pack_md5,pipeline_id,docker_tag,helm_tag) \
+                values('$(params.namespace)','${app}','${md5}','${helm_md5}',$(params.build_no),'v$(params.build_no)','${helm_new_tag}')"
+      else
+        echo "代码无改动"
+      fi
+
+      # 生成helm更新清单，格式：release,旧版,新版,是否改动
+      mkdir -p $(workspaces.common-workspace.path)/source-code/helm-version-list
+      if [ "$old_helm_version" = "" ]; then
+        # 第一次构建
+        echo "first build app, initialize version $helm_new_tag"
+        old_helm_version=$helm_new_tag
+      fi
+      echo "$app,$old_helm_version,$helm_new_tag,$is_upgrade" \
+        > $(workspaces.common-workspace.path)/source-code/helm-version-list/$app
+  sidecars:
+  - image: docker:dind
+    name: server
+    args:
+      - --storage-driver=aufs
+      - --userland-proxy=false
+      - --debug
+      - --insecure-registry=$(params.insecure_registry)
+    securityContext:
+      privileged: true
+    env:
+    # Write generated certs to the path shared with the client.
+    - name: DOCKER_TLS_CERTDIR
+      value: /certs
+    volumeMounts:
+    - mountPath: /var/run/
+      name: dind-socket
+    - mountPath: /certs/client
+      name: dind-certs
+    # 映射pvc到/var/lib/docker目录，这样可以使用docker构建的layer缓存，加速每次ci的镜像构建速度
+    - name: build-cache
+      mountPath: /var/lib/docker
+      subPath: ci-cache/$(params.packages)
+    readinessProbe:
+      periodSeconds: 1
+      exec:
+        command: ['ls', '/certs/client/ca.pem']
+  volumes:
+    - name: dind-certs
+      emptyDir: {}
+    - name: dind-socket
+      emptyDir: {}
+    - name: build-cache
+      persistentVolumeClaim:
+        claimName: docker-cache
+  stepTemplate:
+    env:
+    - name: GOOS
+      value: "linux"
+    - name: GOARCH
+      value: "amd64"
+    - name: GO111MODULE
+      value: "auto"
+    - name: GOCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gocache"
+    - name: GOMODCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gomodcache"
+    - name: CGO_ENABLED
+      value: ""
+    - name: GOSUMDB
+      value: ""
+    # Connect to the sidecar over TCP, with TLS.
+    - name: DOCKER_HOST
+      value: tcp://localhost:2376
+    # Verify TLS.
+    - name: DOCKER_TLS_VERIFY
+      value: '1'
+    # Use the certs generated by the sidecar daemon.
+    - name: DOCKER_CERT_PATH
+      value: /certs/client
+    volumeMounts:
+    - mountPath: /var/run/
+      name: dind-socket
+    - mountPath: /certs/client
+      name: dind-certs

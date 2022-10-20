@@ -1,0 +1,19 @@
+  - name: build-application
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/application"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace

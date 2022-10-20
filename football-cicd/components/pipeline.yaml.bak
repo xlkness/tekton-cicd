@@ -1,0 +1,74 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: football-cicd
+spec:
+  workspaces:
+    - name: source-code
+  params:
+  - name: revision
+    type: string
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+    default: "latest"
+  tasks:
+  - name: clone-repo-task
+    taskRef:
+      name: clone-repo
+    params:
+      - name: revision
+        value: $(params.revision)
+    workspaces:
+      - name: source-code
+        workspace: source-code
+  - name: build-account
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/account"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: source-code
+        workspace: source-code
+  - name: build-activity
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/activity"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/template"
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: source-code
+        workspace: source-code
+  - name: wait-ci-result
+    taskRef:
+      name: wait-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+    workspaces:
+    - name: source-code
+      workspace: source-code
+    runAfter:
+      - build-account
+      - build-activity

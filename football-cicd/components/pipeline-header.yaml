@@ -1,0 +1,119 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: football-cicd
+spec:
+  workspaces:
+    - name: common-workspace
+  params:
+  - name: revision
+    type: string
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  - name: build_no
+    description: 构建自增号，组成镜像版本
+    default: "latest"
+  - name: registry_project
+    description: "仓库项目，镜像全名[$insecure_registry/$registry_project/`basename $packages`:$build_no]"
+  - name: trigger_user
+  - name: gamedata_url
+  - name: gateway-tport
+  - name: gateway-wport
+  - name: gm-port
+  - name: reply-tport1
+  - name: reply-uport1
+  - name: reply-rpcport1
+  - name: reply-traceport1
+  - name: reply-tport2
+  - name: reply-uport2
+  - name: reply-rpcport2
+  - name: reply-traceport2
+  tasks:
+  - name: clone-repo-task
+    taskRef:
+      name: clone-repo
+    params:
+      - name: revision
+        value: $(params.revision)
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-gateway
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/gateway"
+      - name: helm-packages
+        value: "ops/helm/v1/gateway-dep"
+      - name: helm-packages1
+        value: "ops/helm/v1/gateway-svc"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-reply
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/reply"
+      - name: helm-packages
+        value: "ops/helm/v1/reply"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-globalid
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/globalid"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/globalid"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace
+  - name: build-gm
+    taskRef:
+      name: app-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: build_no
+        value: $(params.build_no)
+      - name: packages
+        value: "cmd/micro/gm"
+      - name: helm-packages
+        value: "ops/helm/v1/lobby-rollup/gm"
+      - name: registry_project
+        value: $(params.registry_project)
+    runAfter:
+      - clone-repo-task
+    workspaces:
+      - name: common-workspace
+        workspace: common-workspace

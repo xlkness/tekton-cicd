@@ -1,0 +1,19 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: final-check-status
+spec:
+  params:
+  - name: namespace
+    description: 环境，对应git分支名、k8s namespace
+  workspaces:
+    - name: common-workspace
+  results:
+    - name: is-gateway-upgrade
+      description: "gateway是否触发热更"
+  steps:
+  - name: final-check-status
+    image: harbor.joynova.com:5443/tools/k8sctl:latest
+    script: |
+      echo

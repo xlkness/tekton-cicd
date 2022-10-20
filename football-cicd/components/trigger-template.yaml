@@ -1,0 +1,79 @@
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: pipeline-template
+spec:
+  params:
+  - name: registry_project
+    default: "likun"
+  - name: build_no
+  - name: revision
+  - name: namespace
+  - name: registry_project
+  - name: trigger_user
+  - name: gamedata_url
+  - name: gateway-tport
+  - name: gateway-wport
+  - name: gm-port
+  - name: reply-tport1
+  - name: reply-uport1
+  - name: reply-rpcport1
+  - name: reply-traceport1
+  - name: reply-tport2
+  - name: reply-uport2
+  - name: reply-rpcport2
+  - name: reply-traceport2
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: football-cicd-run-
+    spec:
+      serviceAccountName: build-bot
+      pipelineRef:
+        name: football-cicd
+#       podTemplate:
+#         securityContext:
+#           fsGroup: 65532
+      workspaces:
+        - name: common-workspace
+          persistentVolumeClaim:
+            claimName: build-cache
+      params:
+        - name: registry_project
+          value: $(tt.params.registry_project)
+        - name: revision
+          value: $(tt.params.revision)
+        - name: namespace
+          value: $(tt.params.namespace)
+        - name: build_no
+          value: $(tt.params.build_no)
+        - name: registry_project
+          value: "$(tt.params.registry_project)"
+        - name: gamedata_url
+          value: "$(tt.params.gamedata_url)"
+        - name: trigger_user
+          value: "$(tt.params.trigger_user)"
+        - name: gateway-tport
+          value: $(tt.params.gateway-tport)
+        - name: gateway-wport
+          value: $(tt.params.gateway-wport)
+        - name: gm-port
+          value: $(tt.params.gm-port)
+        - name: reply-tport1
+          value: $(tt.params.reply-tport1)
+        - name: reply-uport1
+          value: $(tt.params.reply-uport1)
+        - name: reply-rpcport1
+          value: $(tt.params.reply-rpcport1)
+        - name: reply-traceport1
+          value: $(tt.params.reply-traceport1)
+        - name: reply-tport2
+          value: $(tt.params.reply-tport2)
+        - name: reply-uport2
+          value: $(tt.params.reply-uport2)
+        - name: reply-rpcport2
+          value: $(tt.params.reply-rpcport2)
+        - name: reply-traceport2
+          value: $(tt.params.reply-traceport2)

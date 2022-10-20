@@ -1,0 +1,42 @@
+  - name: wait-ci-result
+    taskRef:
+      name: wait-ci
+    params:
+      - name: namespace
+        value: $(params.namespace)
+      - name: revision
+        value: $(params.revision)
+      - name: build_no
+        value: $(params.build_no)
+      - name: registry_project
+        value: $(params.registry_project)
+      - name: trigger_user
+        value: $(params.trigger_user)
+      - name: gamedata_url
+        value: $(params.gamedata_url)
+      - name: gateway-tport
+        value: $(params.gateway-tport)
+      - name: gateway-wport
+        value: $(params.gateway-wport)
+      - name: gm-port
+        value: $(params.gm-port)
+      - name: reply-tport1
+        value: $(params.reply-tport1)
+      - name: reply-uport1
+        value: $(params.reply-uport1)
+      - name: reply-rpcport1
+        value: $(params.reply-rpcport1)
+      - name: reply-traceport1
+        value: $(params.reply-traceport1)
+      - name: reply-tport2
+        value: $(params.reply-tport2)
+      - name: reply-uport2
+        value: $(params.reply-uport2)
+      - name: reply-rpcport2
+        value: $(params.reply-rpcport2)
+      - name: reply-traceport2
+        value: $(params.reply-traceport2)
+    workspaces:
+    - name: common-workspace
+      workspace: common-workspace
+    runAfter:

@@ -1,0 +1,202 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: clone-repo
+spec:
+  workspaces:
+    - name: common-workspace
+      description: git clone的源码目录
+    - name: ssh-directory
+      optional: true
+    - name: basic-auth
+      optional: true
+    - name: ssl-ca-directory
+      optional: true
+  params:
+    - name: revision
+      description: Revision to checkout. (branch, tag, sha, ref, etc...)
+      type: string
+    - name: url
+      type: string
+      default: "http://gitlab-14/greenly/greenly-master.git"
+    - name: pre_check_packages
+      type: string
+      description: 预编译检查整体语法错误
+      default: "cmd/all_in_one"
+  results:
+    - name: commit
+      description: The precise commit SHA that was fetched by this Task.
+    - name: url
+      description: The precise URL that was fetched by this Task.
+    - name: author
+    - name: msg
+      description: git提交注释
+  steps:
+    - name: clone
+      image: "dyrnq/tektoncd-pipeline-cmd-git-init:v0.29.0"
+#       securityContext:
+#         runAsNonRoot: true
+#         runAsUser: 65532
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        date +%s > $(workspaces.common-workspace.path)/start-ts
+        if [ "${PARAM_VERBOSE}" = "true" ] ; then
+          set -x
+        fi
+        set -x
+        if [ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" = "true" ] ; then
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" "${PARAM_USER_HOME}/.git-credentials"
+          cp "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.gitconfig" "${PARAM_USER_HOME}/.gitconfig"
+          chmod 400 "${PARAM_USER_HOME}/.git-credentials"
+          chmod 400 "${PARAM_USER_HOME}/.gitconfig"
+        fi
+        if [ "${WORKSPACE_SSH_DIRECTORY_BOUND}" = "true" ] ; then
+          cp -R "${WORKSPACE_SSH_DIRECTORY_PATH}" "${PARAM_USER_HOME}"/.ssh
+          chmod 700 "${PARAM_USER_HOME}"/.ssh
+          chmod -R 400 "${PARAM_USER_HOME}"/.ssh/*
+        fi
+        if [ "${WORKSPACE_SSL_CA_DIRECTORY_BOUND}" = "true" ] ; then
+           export GIT_SSL_CAPATH1="${WORKSPACE_SSL_CA_DIRECTORY_PATH}"
+           if [ "${PARAM_CRT_FILENAME}" != "" ] ; then
+              export GIT_SSL_CAINFO1="${WORKSPACE_SSL_CA_DIRECTORY_PATH}/${PARAM_CRT_FILENAME}"
+           fi
+        fi
+        CHECKOUT_DIR="${WORKSPACE_OUTPUT_PATH}/"
+        mkdir -p ${CHECKOUT_DIR}
+
+        # 清理仓库拉取目录
+        # 删除隐藏文件
+        rm -rf "${CHECKOUT_DIR}"/.[!.]*
+        # 删除所有文件
+        rm -rf "${CHECKOUT_DIR:?}"/*
+
+        test -z "${PARAM_HTTP_PROXY}" || export HTTP_PROXY="${PARAM_HTTP_PROXY}"
+        test -z "${PARAM_HTTPS_PROXY}" || export HTTPS_PROXY="${PARAM_HTTPS_PROXY}"
+        test -z "${PARAM_NO_PROXY}" || export NO_PROXY="${PARAM_NO_PROXY}"
+        /ko-app/git-init \
+          -url="${PARAM_URL}" \
+          -revision="${PARAM_REVISION}" \
+          -refspec="${PARAM_REFSPEC}" \
+          -path="${CHECKOUT_DIR}" \
+          -sslVerify="${PARAM_SSL_VERIFY}" \
+          -submodules="${PARAM_SUBMODULES}" \
+          -depth="0" \
+          -sparseCheckoutDirectories="${PARAM_SPARSE_CHECKOUT_DIRECTORIES}"
+        cd "${CHECKOUT_DIR}"
+        RESULT_SHA="$(git rev-parse HEAD)"
+        AUTHOR="$(git log --pretty=format:'%an' | head -n 1)"
+        MSG="$(git log --pretty=format:'%s' | head -n 1)"
+        EXIT_CODE="$?"
+        if [ "${EXIT_CODE}" != 0 ] ; then
+          exit "${EXIT_CODE}"
+        fi
+        printf "%s" "${RESULT_SHA}" > "$(results.commit.path)"
+        printf "%s" "${PARAM_URL}" > "$(results.url.path)"
+        printf "%s" "${AUTHOR}" > "$(results.author.path)"
+        printf "%s" "${MSG}" > "$(results.msg.path)"
+        echo "output path:"
+        ls ${CHECKOUT_DIR}
+        cat $(results.commit.path) > ${CHECKOUT_DIR}/git-sha
+        cat $(results.author.path) > ${CHECKOUT_DIR}/git-author
+        cat $(results.msg.path) > ${CHECKOUT_DIR}/git-msg
+    - name: pre-check
+      image: golang:1.18.1
+      workingDir: $(workspaces.common-workspace.path)/source-code
+      script: |
+        # 预先编译all_in_one检查是否可以编译
+
+        # 修改hosts
+        echo "192.168.1.14 joynova.com" >> /etc/hosts
+        echo "192.168.1.146 harbor.joynova.com" >> /etc/hosts
+
+        app=`basename $(params.pre_check_packages)`
+        echo "compile application:"$app
+
+        mkdir -p $GOMODCACHE
+        mkdir -p $GOCACHE
+
+        set -x
+
+        cd $(workspaces.common-workspace.path)/source-code
+
+        # 配置私有仓库访问
+        go env -w GOPROXY=https://goproxy.cn
+        go env -w GOINSECURE="joynova.com"
+        go env -w GOPRIVATE="joynova.com"
+        go env -w GONOSUMDB="joynova.com"
+        echo "===============go env===================="
+        go env
+        echo "========================================="
+        #git config --global url."git@joynova.com".insteadOf "http://joynova.com"
+
+        # 拉取依赖
+        go mod tidy
+        echo "go mod拉取依赖完毕。"
+
+        # 进入目录开始编译
+        cd $(workspaces.common-workspace.path)/source-code/$(params.pre_check_packages)
+        pwd
+        go build -v
+        cd $(workspaces.common-workspace.path)/source-code/tools/dev_tools
+        go build -v -o db_sync_new db_sync.go
+  stepTemplate:
+    env:
+    - name: HOME
+      value: "/tekton/home"
+    - name: PARAM_URL
+      value: $(params.url)
+    - name: PARAM_REVISION
+      value: $(params.revision)
+    - name: PARAM_REFSPEC
+      value: ""
+    - name: PARAM_SUBMODULES
+      value: "true"
+    - name: PARAM_DEPTH
+      value: "1"
+    - name: PARAM_SSL_VERIFY
+      value: "false"
+    - name: PARAM_CRT_FILENAME
+      value: "ca-bundle.crt"
+    - name: PARAM_DELETE_EXISTING
+      value: "true"
+    - name: PARAM_HTTP_PROXY
+      value: ""
+    - name: PARAM_HTTPS_PROXY
+      value: ""
+    - name: PARAM_NO_PROXY
+      value: ""
+    - name: PARAM_VERBOSE
+      value: "true"
+    - name: PARAM_SPARSE_CHECKOUT_DIRECTORIES
+      value: ""
+    - name: PARAM_USER_HOME
+      value: "/tekton/home"
+    - name: WORKSPACE_OUTPUT_PATH
+      value: $(workspaces.common-workspace.path)/source-code
+    - name: WORKSPACE_SSH_DIRECTORY_BOUND
+      value: $(workspaces.ssh-directory.bound)
+    - name: WORKSPACE_SSH_DIRECTORY_PATH
+      value: $(workspaces.ssh-directory.path)
+    - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
+      value: $(workspaces.basic-auth.bound)
+    - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
+      value: $(workspaces.basic-auth.path)
+    - name: WORKSPACE_SSL_CA_DIRECTORY_BOUND
+      value: $(workspaces.ssl-ca-directory.bound)
+    - name: WORKSPACE_SSL_CA_DIRECTORY_PATH
+      value: $(workspaces.ssl-ca-directory.path)
+    - name: GOOS
+      value: "linux"
+    - name: GOARCH
+      value: "amd64"
+    - name: GO111MODULE
+      value: "on"
+    - name: GOCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gocache"
+    - name: GOMODCACHE
+      value: "$(workspaces.common-workspace.path)/ci-cache/gomodcache"
+    - name: CGO_ENABLED
+      value: ""
+
