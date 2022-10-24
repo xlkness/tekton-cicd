@@ -3,4 +3,4 @@
 ## 架构
 <img src="https://raw.githubusercontent.com/xlkness/tekton-cicd/master/tekton-cicd.jpg">
 ## 流水线结果
-<img src="https://war.githubusercontent.com/xlkness/tekton-cicd/master/notify.jpg">
+<img src="https://raw.githubusercontent.com/xlkness/tekton-cicd/master/notify.jpg">
